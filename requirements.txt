@@ -1,0 +1,6 @@
+# PostgreSQL backend (optional — only needed when pushing to / reading from PostgreSQL)
+psycopg2-binary>=2.9
+
+# All other dependencies are Python standard library (>=3.11):
+#   argparse, collections, datetime, hashlib, json, math, os,
+#   pathlib, re, socket, subprocess, sys
