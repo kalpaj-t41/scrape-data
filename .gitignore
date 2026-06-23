@@ -22,6 +22,8 @@ secrets.json
 
 # Local metrics store (SQLite outputs)
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 metrics.json
 metrics_*.json

@@ -29,6 +29,17 @@ def _dumps(obj) -> str:
     return json.dumps(obj, default=_default)
 
 
+def _week_of(ts: str | None) -> str | None:
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        iso = dt.isocalendar()
+        return f"{iso.year}-W{iso.week:02d}"
+    except Exception:
+        return None
+
+
 def CentralStore(db_path=None):
     """
     Factory — returns the right backend based on db_path type / value.
@@ -79,6 +90,12 @@ CREATE TABLE IF NOT EXISTS facets (
     pushed_at     TEXT NOT NULL,
     data          TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    session_id    TEXT PRIMARY KEY,
+    developer_key TEXT,
+    pushed_at     TEXT NOT NULL,
+    data          TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS app_state (
     developer_key TEXT PRIMARY KEY,
     pushed_at     TEXT NOT NULL,
@@ -100,7 +117,19 @@ CREATE TABLE IF NOT EXISTS developers (
 CREATE INDEX IF NOT EXISTS idx_sm_dev  ON session_metas(developer_key);
 CREATE INDEX IF NOT EXISTS idx_sm_week ON session_metas(week);
 CREATE INDEX IF NOT EXISTS idx_sm_date ON session_metas(date);
-CREATE INDEX IF NOT EXISTS idx_te_dev  ON turn_events(developer_key)
+CREATE INDEX IF NOT EXISTS idx_te_dev  ON turn_events(developer_key);
+CREATE TABLE IF NOT EXISTS busy_segments (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL,
+    developer_key TEXT NOT NULL,
+    start_ts      TEXT,
+    end_ts        TEXT,
+    is_sidechain  INTEGER DEFAULT 0,
+    week          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_bs_sid ON busy_segments(session_id);
+CREATE INDEX IF NOT EXISTS idx_bs_dev ON busy_segments(developer_key);
+CREATE INDEX IF NOT EXISTS idx_bs_week ON busy_segments(week)
 """
 
 
@@ -195,6 +224,7 @@ CREATE TABLE IF NOT EXISTS scrape_data.plans (
 
 ALTER TABLE scrape_data.session_metas ADD COLUMN IF NOT EXISTS ai_title    TEXT;
 ALTER TABLE scrape_data.session_metas ADD COLUMN IF NOT EXISTS agent_names JSONB DEFAULT '[]';
+ALTER TABLE scrape_data.session_metas ADD COLUMN IF NOT EXISTS source      TEXT;
 
 CREATE TABLE IF NOT EXISTS scrape_data.agent_tasks (
     id               BIGSERIAL PRIMARY KEY,
@@ -208,6 +238,16 @@ CREATE TABLE IF NOT EXISTS scrape_data.agent_tasks (
     week             TEXT,
     pushed_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS scrape_data.background_tasks (
+    id            BIGSERIAL PRIMARY KEY,
+    session_id    TEXT NOT NULL,
+    developer_key TEXT NOT NULL,
+    enqueued_at   TIMESTAMPTZ,
+    week          TEXT,
+    pushed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_bt_sid ON scrape_data.background_tasks(session_id);
 
 CREATE INDEX IF NOT EXISTS idx_sm_dev   ON scrape_data.session_metas(developer_key);
 CREATE INDEX IF NOT EXISTS idx_sm_week  ON scrape_data.session_metas(week);
@@ -226,7 +266,22 @@ CREATE TABLE IF NOT EXISTS scrape_data.developers (
     email         TEXT,
     claude_dirs   JSONB DEFAULT '[]',
     pushed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-)
+);
+
+CREATE TABLE IF NOT EXISTS scrape_data.busy_segments (
+    id            BIGSERIAL PRIMARY KEY,
+    session_id    TEXT NOT NULL,
+    developer_key TEXT NOT NULL,
+    start_ts      TIMESTAMPTZ,
+    end_ts        TIMESTAMPTZ,
+    is_sidechain  BOOLEAN DEFAULT FALSE,
+    week          TEXT,
+    pushed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_bs_sid  ON scrape_data.busy_segments(session_id);
+CREATE INDEX IF NOT EXISTS idx_bs_dev  ON scrape_data.busy_segments(developer_key);
+CREATE INDEX IF NOT EXISTS idx_bs_week ON scrape_data.busy_segments(week)
 """
 
 _SM_COLS = [
@@ -255,19 +310,31 @@ _F_COLS = [
 class _BaseStore:
     """Shared push / pull / stats logic for SQLite — backends supply _execute / _commit / _fetchall."""
 
-    def push(self, raw: dict) -> dict:
+    def push(self, raw: dict, force: bool = False) -> dict:
+        # force is honored only for busy_segments (session-level replace, always on);
+        # other SQLite tables use INSERT OR IGNORE / REPLACE semantics.
         now = datetime.now(tz=timezone.utc).isoformat()
-        inserted = {"session_metas": 0, "turn_events": 0, "facets": 0, "app_state": 0, "plans": 0}
+        inserted = {"session_metas": 0, "turn_events": 0, "facets": 0, "app_state": 0, "plans": 0, "agent_tasks": 0, "busy_segments": 0}
 
         for meta in raw.get("session_metas", []):
             sid = meta.get("session_id")
             if not sid:
                 continue
-            n = self._upsert_ignore(
-                "INSERT INTO session_metas (session_id, developer_key, week, date, pushed_at, data) "
-                "VALUES ({p},{p},{p},{p},{p},{p})",
-                (sid, meta.get("developer_key", ""), meta.get("week"), meta.get("date"), now, _dumps(meta)),
-            )
+            if force:
+                # Refresh existing rows (e.g. cutover to JSONL-primary records).
+                n = self._upsert_replace(
+                    "session_metas",
+                    {"session_id": sid, "developer_key": meta.get("developer_key", ""),
+                     "week": meta.get("week"), "date": meta.get("date"),
+                     "pushed_at": now, "data": _dumps(meta)},
+                    conflict_col="session_id",
+                )
+            else:
+                n = self._upsert_ignore(
+                    "INSERT INTO session_metas (session_id, developer_key, week, date, pushed_at, data) "
+                    "VALUES ({p},{p},{p},{p},{p},{p})",
+                    (sid, meta.get("developer_key", ""), meta.get("week"), meta.get("date"), now, _dumps(meta)),
+                )
             inserted["session_metas"] += n
 
         turns_by_session: dict[str, list] = {}
@@ -307,6 +374,36 @@ class _BaseStore:
             )
             inserted["plans"] += n
 
+        # agent_tasks — full session record as JSON (preserves tasks + background_tasks).
+        # REPLACE so re-pushes refresh the record (e.g. new background_tasks field).
+        for sid, at in raw.get("agent_tasks", {}).items():
+            if not sid:
+                continue
+            n = self._upsert_replace(
+                "agent_tasks",
+                {"session_id": sid, "developer_key": at.get("developer_key", ""),
+                 "pushed_at": now, "data": _dumps(at)},
+                conflict_col="session_id",
+            )
+            inserted["agent_tasks"] += n
+
+        # busy_segments — session-level replace (reparse of JSONL is authoritative)
+        seg_sids = {s.get("session_id") for s in raw.get("busy_segments", []) if s.get("session_id")}
+        for sid in seg_sids:
+            self._execute("DELETE FROM busy_segments WHERE session_id = {p}", (sid,))
+        for s in raw.get("busy_segments", []):
+            sid = s.get("session_id")
+            if not sid:
+                continue
+            self._execute(
+                "INSERT INTO busy_segments "
+                "(session_id, developer_key, start_ts, end_ts, is_sidechain, week) "
+                "VALUES ({p},{p},{p},{p},{p},{p})",
+                (sid, s.get("developer_key", ""), s.get("start_ts"), s.get("end_ts"),
+                 1 if s.get("is_sidechain") else 0, _week_of(s.get("start_ts"))),
+            )
+            inserted["busy_segments"] += 1
+
         self._commit()
         return inserted
 
@@ -341,7 +438,8 @@ class _BaseStore:
         return set()  # SQLite — collect all sessions each run
 
     def pushed_agent_session_ids(self) -> set[str]:
-        return set()  # SQLite has no agent_tasks table — collect all sessions
+        rows = self._fetchall("SELECT session_id FROM agent_tasks")
+        return {r[0] for r in rows}
 
     def pull_raw(self, since: datetime | None = None) -> dict:
         since_date = since.date().isoformat() if since else None
@@ -375,12 +473,35 @@ class _BaseStore:
         rows = self._fetchall("SELECT developer_key, data FROM plans")
         plans = {r[0]: json.loads(r[1]) for r in rows}
 
+        # agent_tasks — full records (not gated by session_metas): background_tasks
+        # may live in JSONL-only sessions; parallel_agents/harness read them directly.
+        agent_tasks: dict[str, dict] = {}
+        for r in self._fetchall("SELECT session_id, data FROM agent_tasks"):
+            agent_tasks[r[0]] = json.loads(r[1])
+
+        # All segments (not gated by session_metas): they carry their own
+        # developer_key + start_ts, so agent_hours doesn't need the session
+        # registry. JSONL-only sessions (no session-meta) still count.
+        busy_segments: list[dict] = []
+        for r in self._fetchall(
+            "SELECT session_id, developer_key, start_ts, end_ts, is_sidechain FROM busy_segments"
+        ):
+            busy_segments.append({
+                "session_id":    r[0],
+                "developer_key": r[1],
+                "start_ts":      r[2],
+                "end_ts":        r[3],
+                "is_sidechain":  bool(r[4]),
+            })
+
         return {
             "session_metas": session_metas,
             "turn_events":   turn_events,
             "facets":        facets,
             "app_state":     app_state,
             "plans":         plans,
+            "agent_tasks":   agent_tasks,
+            "busy_segments": busy_segments,
         }
 
     def stats(self) -> dict:
@@ -390,6 +511,8 @@ class _BaseStore:
             "facets":        self._fetchall("SELECT COUNT(*) FROM facets")[0][0],
             "app_state":     self._fetchall("SELECT COUNT(*) FROM app_state")[0][0],
             "plans":         self._fetchall("SELECT COUNT(*) FROM plans")[0][0],
+            "agent_tasks":   self._fetchall("SELECT COUNT(*) FROM agent_tasks")[0][0],
+            "busy_segments": self._fetchall("SELECT COUNT(*) FROM busy_segments")[0][0],
             "developers":    self._fetchall(
                 "SELECT COUNT(DISTINCT developer_key) FROM session_metas"
             )[0][0],
@@ -489,7 +612,7 @@ class _PostgresStore:
         from psycopg2.extras import Json, execute_values
 
         now = datetime.now(tz=timezone.utc)
-        inserted = {"session_metas": 0, "turn_events": 0, "facets": 0, "app_state": 0, "plans": 0, "agent_tasks": 0}
+        inserted = {"session_metas": 0, "turn_events": 0, "facets": 0, "app_state": 0, "plans": 0, "agent_tasks": 0, "background_tasks": 0, "busy_segments": 0}
         cur = self._conn.cursor()
 
         # In force mode, delete existing rows for all incoming sessions before re-inserting
@@ -497,6 +620,7 @@ class _PostgresStore:
             all_sids = (
                 {m.get("session_id") for m in raw.get("session_metas", []) if m.get("session_id")}
                 | {t.get("session_id") for t in raw.get("turn_events", []) if t.get("session_id")}
+                | {s.get("session_id") for s in raw.get("busy_segments", []) if s.get("session_id")}
                 | set(raw.get("facets", {}).keys())
                 | set(raw.get("agent_tasks", {}).keys())
             )
@@ -504,6 +628,8 @@ class _PostgresStore:
                 sid_list = list(all_sids)
                 cur.execute("DELETE FROM scrape_data.turn_events  WHERE session_id = ANY(%s)", (sid_list,))
                 cur.execute("DELETE FROM scrape_data.agent_tasks  WHERE session_id = ANY(%s)", (sid_list,))
+                cur.execute("DELETE FROM scrape_data.background_tasks WHERE session_id = ANY(%s)", (sid_list,))
+                cur.execute("DELETE FROM scrape_data.busy_segments WHERE session_id = ANY(%s)", (sid_list,))
                 cur.execute("DELETE FROM scrape_data.facets       WHERE session_id = ANY(%s)", (sid_list,))
                 cur.execute("DELETE FROM scrape_data.session_metas WHERE session_id = ANY(%s)", (sid_list,))
 
@@ -542,6 +668,7 @@ class _PostgresStore:
                 Json(meta.get("tool_counts") or {}),
                 Json(meta.get("languages") or {}),
                 Json(meta.get("user_response_times") or []),
+                meta.get("source"),
                 now,
             ))
         if sm_rows:
@@ -556,21 +683,26 @@ class _PostgresStore:
                     first_prompt, user_interruptions, tool_errors,
                     uses_task_agent, uses_mcp, uses_web_search, uses_web_fetch,
                     input_tokens, output_tokens,
-                    tool_counts, languages, user_response_times, pushed_at
+                    tool_counts, languages, user_response_times, source, pushed_at
                 ) VALUES %s ON CONFLICT (session_id) DO NOTHING
                 """,
                 sm_rows,
             )
             inserted["session_metas"] = cur.rowcount
 
-        # ── turn_events — bulk insert, session-level dedup ────────────────────
-        existing_te = self._existing_turn_sessions(cur)
+        # ── turn_events — bulk insert, turn-level dedup ───────────────────────
+        # Skills use session-level dedup (they don't accumulate mid-session).
+        # Turn rows use turn-level dedup (max user_ts per session) so that active
+        # sessions accumulate new turns on every push without re-inserting old ones.
+        existing_te  = self._existing_turn_sessions(cur)
+        max_turn_ts  = self._max_turn_ts_per_session(cur)   # {sid: datetime}
         skill_rows, turn_rows = [], []
         for t in raw.get("turn_events", []):
             sid = t.get("session_id", "")
-            if sid in existing_te:
-                continue
             if t.get("event_type") == "skill":
+                # Skills: session-level dedup — collected once per session at creation time
+                if sid in existing_te:
+                    continue
                 skill_rows.append((
                     sid,
                     t.get("developer_key", ""),
@@ -582,6 +714,19 @@ class _PostgresStore:
                     now,
                 ))
             else:
+                # Turns: turn-level dedup via max user_ts — active sessions accumulate
+                max_ts = max_turn_ts.get(sid)
+                if max_ts:
+                    user_ts_str = t.get("user_ts")
+                    if not user_ts_str:
+                        continue
+                    try:
+                        from datetime import datetime as _dt
+                        user_ts_dt = _dt.fromisoformat(user_ts_str.replace("Z", "+00:00"))
+                        if user_ts_dt <= max_ts:
+                            continue
+                    except Exception:
+                        continue
                 turn_rows.append((
                     sid,
                     t.get("developer_key", ""),
@@ -767,6 +912,61 @@ class _PostgresStore:
             )
             inserted["agent_tasks"] = len(at_rows)
 
+        # ── background_tasks — agent-less queue-operation enqueues (harness M7) ──
+        bt_rows = []
+        for session_id, at_data in raw.get("agent_tasks", {}).items():
+            if session_id in existing_at:
+                continue
+            dev_key = at_data.get("developer_key", "")
+            for bt in at_data.get("background_tasks", []) or []:
+                bt_rows.append((session_id, dev_key, bt.get("enqueued_at"), bt.get("week"), now))
+        if bt_rows:
+            execute_values(
+                cur,
+                """
+                INSERT INTO scrape_data.background_tasks (
+                    session_id, developer_key, enqueued_at, week, pushed_at
+                ) VALUES %s
+                """,
+                bt_rows,
+            )
+            inserted["background_tasks"] = len(bt_rows)
+
+        # ── busy_segments — session-level replace (reparse is authoritative) ──
+        seg_rows = []
+        seg_sids = set()
+        for s in raw.get("busy_segments", []):
+            sid = s.get("session_id")
+            if not sid:
+                continue
+            seg_sids.add(sid)
+            seg_rows.append((
+                sid,
+                s.get("developer_key", ""),
+                s.get("start_ts"),
+                s.get("end_ts"),
+                bool(s.get("is_sidechain", False)),
+                _week_of(s.get("start_ts")),
+                now,
+            ))
+        if seg_sids and not force:
+            # force mode already deleted these above; otherwise refresh per session
+            cur.execute(
+                "DELETE FROM scrape_data.busy_segments WHERE session_id = ANY(%s)",
+                (list(seg_sids),),
+            )
+        if seg_rows:
+            execute_values(
+                cur,
+                """
+                INSERT INTO scrape_data.busy_segments (
+                    session_id, developer_key, start_ts, end_ts, is_sidechain, week, pushed_at
+                ) VALUES %s
+                """,
+                seg_rows,
+            )
+            inserted["busy_segments"] = len(seg_rows)
+
         self._conn.commit()
         return inserted
 
@@ -781,6 +981,16 @@ class _PostgresStore:
             cur = self._conn.cursor()
         cur.execute("SELECT DISTINCT session_id FROM scrape_data.turn_events")
         return {r[0] for r in cur.fetchall()}
+
+    def _max_turn_ts_per_session(self, cur=None) -> dict:
+        """Return {session_id: max_user_ts datetime} for sessions in turn_events."""
+        if cur is None:
+            cur = self._conn.cursor()
+        cur.execute(
+            "SELECT session_id, MAX(user_ts) FROM scrape_data.turn_events "
+            "WHERE event_type = 'turn' AND user_ts IS NOT NULL GROUP BY session_id"
+        )
+        return {r[0]: r[1] for r in cur.fetchall() if r[1]}
 
     # ── pushed_session_ids ────────────────────────────────────────────────────
 
@@ -921,6 +1131,39 @@ class _PostgresStore:
                     "enqueued_at":      enq.isoformat() if hasattr(enq, "isoformat") else enq,
                 })
 
+            # background_tasks — agent-less enqueues (harness M7 background component)
+            for row in self._fetchall(
+                f"SELECT session_id, developer_key, enqueued_at, week "
+                f"FROM scrape_data.background_tasks WHERE session_id IN ({ph})",
+                args,
+            ):
+                sid = row[0]
+                if sid not in agent_tasks_result:
+                    agent_tasks_result[sid] = {"developer_key": row[1], "tasks": []}
+                enq = row[2]
+                agent_tasks_result[sid].setdefault("background_tasks", []).append({
+                    "enqueued_at": enq.isoformat() if hasattr(enq, "isoformat") else enq,
+                    "week":        row[3],
+                })
+
+        # busy_segments — accurate agent-hours source. Not gated by session_metas:
+        # segments carry developer_key + start_ts, so JSONL-only sessions still count.
+        busy_segments: list[dict] = []
+        seg_sql = ("SELECT session_id, developer_key, start_ts, end_ts, is_sidechain "
+                   "FROM scrape_data.busy_segments")
+        if since_date:
+            seg_rows = self._fetchall(seg_sql + " WHERE start_ts >= %s OR start_ts IS NULL", (since,))
+        else:
+            seg_rows = self._fetchall(seg_sql)
+        for row in seg_rows:
+            busy_segments.append({
+                "session_id":    row[0],
+                "developer_key": row[1],
+                "start_ts":      row[2].isoformat() if hasattr(row[2], "isoformat") else row[2],
+                "end_ts":        row[3].isoformat() if hasattr(row[3], "isoformat") else row[3],
+                "is_sidechain":  bool(row[4]),
+            })
+
         return {
             "session_metas": session_metas,
             "turn_events":   turn_events,
@@ -928,6 +1171,7 @@ class _PostgresStore:
             "app_state":     app_state,
             "plans":         plans,
             "agent_tasks":   agent_tasks_result,
+            "busy_segments": busy_segments,
         }
 
     # ── stats ─────────────────────────────────────────────────────────────────
@@ -940,6 +1184,8 @@ class _PostgresStore:
             "app_state":     self._fetchall("SELECT COUNT(*) FROM scrape_data.app_state")[0][0],
             "plans":         self._fetchall("SELECT COUNT(*) FROM scrape_data.plans")[0][0],
             "agent_tasks":   self._fetchall("SELECT COUNT(*) FROM scrape_data.agent_tasks")[0][0],
+            "background_tasks": self._fetchall("SELECT COUNT(*) FROM scrape_data.background_tasks")[0][0],
+            "busy_segments": self._fetchall("SELECT COUNT(*) FROM scrape_data.busy_segments")[0][0],
             "developers":    self._fetchall(
                 "SELECT COUNT(DISTINCT developer_key) FROM scrape_data.session_metas"
             )[0][0],

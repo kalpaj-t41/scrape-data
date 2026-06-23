@@ -8,6 +8,8 @@ High trust = low interruptions, fast iteration, autoEdit or bypassPermissions.
 
 from collections import defaultdict
 
+from computers.base import ComputeContext, MetricComputer
+from computers.registry import registry
 
 _PERMISSION_WEIGHTS = {
     "bypassPermissions": 1.0,
@@ -46,53 +48,55 @@ def _session_trust(meta: dict, session_turns: list[dict]) -> float:
     return (interruption_factor * 0.50) + (completion_factor * 0.20) + (permission_factor * 0.30)
 
 
-def compute(
-    sessions_by_dev: dict[str, list[dict]],
-    turns_by_session: dict[str, list[dict]],
-) -> dict[str, dict]:
-    """Return {developer_key: {trust_index, components, by_week}}."""
+@registry.register
+class Trust(MetricComputer):
+    name = "trust"
 
-    dev_trusts: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
-    dev_interruptions: dict[str, int] = defaultdict(int)
-    dev_permission_modes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    def compute(self, ctx: ComputeContext) -> dict:
+        sessions_by_dev = ctx.sessions_by_dev
+        turns_by_session = ctx.turns_by_session
 
-    for key, sessions in sessions_by_dev.items():
-        for meta in sessions:
-            sid = meta["session_id"]
-            week = meta.get("week") or "unknown"
-            session_turns = [t for t in turns_by_session.get(sid, []) if t.get("event_type") != "skill"]
+        dev_trusts: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+        dev_interruptions: dict[str, int] = defaultdict(int)
+        dev_permission_modes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
-        score = _session_trust(meta, session_turns)
-        dev_trusts[key][week].append(score)
-        dev_interruptions[key] += meta.get("user_interruptions") or 0
+        for key, sessions in sessions_by_dev.items():
+            for meta in sessions:
+                sid = meta["session_id"]
+                week = meta.get("week") or "unknown"
+                session_turns = [t for t in turns_by_session.get(sid, []) if t.get("event_type") != "skill"]
 
-        for t in session_turns:
-            mode = t.get("permission_mode")
-            if mode:
-                dev_permission_modes[key][mode] += 1
+                score = _session_trust(meta, session_turns)
+                dev_trusts[key][week].append(score)
+                dev_interruptions[key] += meta.get("user_interruptions") or 0
 
-    results: dict[str, dict] = {}
-    for key in dev_trusts:
-        all_scores = [s for scores in dev_trusts[key].values() for s in scores]
-        avg = round(sum(all_scores) / len(all_scores) * 100, 1) if all_scores else 0.0
+                for t in session_turns:
+                    mode = t.get("permission_mode")
+                    if mode:
+                        dev_permission_modes[key][mode] += 1
 
-        modes = dev_permission_modes.get(key, {})
-        total_mode_events = sum(modes.values()) or 1
-        permission_dist = {
-            m: round(c / total_mode_events * 100, 1) for m, c in modes.items()
-        }
+        results: dict[str, dict] = {}
+        for key in dev_trusts:
+            all_scores = [s for scores in dev_trusts[key].values() for s in scores]
+            avg = round(sum(all_scores) / len(all_scores) * 100, 1) if all_scores else 0.0
 
-        by_week = {
-            w: round(sum(scores) / len(scores) * 100, 1)
-            for w, scores in dev_trusts[key].items()
-        }
+            modes = dev_permission_modes.get(key, {})
+            total_mode_events = sum(modes.values()) or 1
+            permission_dist = {
+                m: round(c / total_mode_events * 100, 1) for m, c in modes.items()
+            }
 
-        results[key] = {
-            "developer_key": key,
-            "trust_index": avg,
-            "total_interruptions": dev_interruptions.get(key, 0),
-            "permission_mode_distribution": permission_dist,
-            "by_week": by_week,
-        }
+            by_week = {
+                w: round(sum(scores) / len(scores) * 100, 1)
+                for w, scores in dev_trusts[key].items()
+            }
 
-    return results
+            results[key] = {
+                "developer_key": key,
+                "trust_index": avg,
+                "total_interruptions": dev_interruptions.get(key, 0),
+                "permission_mode_distribution": permission_dist,
+                "by_week": by_week,
+            }
+
+        return results

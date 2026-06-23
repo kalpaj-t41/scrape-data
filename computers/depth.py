@@ -7,6 +7,8 @@ High depth = Claude took meaningful actions (tool calls, code changes, commits).
 
 from collections import defaultdict
 
+from computers.base import ComputeContext, MetricComputer
+from computers.registry import registry
 
 _TOOL_WEIGHTS = {
     "Workflow":  5,
@@ -55,38 +57,41 @@ def _label(score: float) -> str:
     return "quick_query"
 
 
-def compute(sessions_by_dev: dict[str, list[dict]]) -> dict[str, dict]:
-    """Return {developer_key: {avg_depth, by_week, session_distribution}}."""
-    results: dict[str, dict] = {}
+@registry.register
+class Depth(MetricComputer):
+    name = "depth"
 
-    for key, sessions in sessions_by_dev.items():
-        weeks: dict[str, list[float]] = defaultdict(list)
-        for meta in sessions:
-            weeks[meta.get("week") or "unknown"].append(_session_depth(meta))
+    def compute(self, ctx: ComputeContext) -> dict:
+        results: dict[str, dict] = {}
 
-        all_scores = [s for scores in weeks.values() for s in scores]
-        avg = round(sum(all_scores) / len(all_scores), 1) if all_scores else 0.0
+        for key, sessions in ctx.sessions_by_dev.items():
+            weeks: dict[str, list[float]] = defaultdict(list)
+            for meta in sessions:
+                weeks[meta.get("week") or "unknown"].append(_session_depth(meta))
 
-        distribution = {"quick_query": 0, "light_assistance": 0, "meaningful_work": 0, "deep_development": 0}
-        for s in all_scores:
-            distribution[_label(s)] += 1
+            all_scores = [s for scores in weeks.values() for s in scores]
+            avg = round(sum(all_scores) / len(all_scores), 1) if all_scores else 0.0
 
-        by_week = {
-            w: {
-                "avg_depth":     round(sum(scores) / len(scores), 1),
-                "session_count": len(scores),
-                "max_depth":     round(max(scores), 1),
+            distribution = {"quick_query": 0, "light_assistance": 0, "meaningful_work": 0, "deep_development": 0}
+            for s in all_scores:
+                distribution[_label(s)] += 1
+
+            by_week = {
+                w: {
+                    "avg_depth":     round(sum(scores) / len(scores), 1),
+                    "session_count": len(scores),
+                    "max_depth":     round(max(scores), 1),
+                }
+                for w, scores in weeks.items()
             }
-            for w, scores in weeks.items()
-        }
 
-        results[key] = {
-            "developer_key":        key,
-            "avg_depth_score":      avg,
-            "depth_label":          _label(avg),
-            "session_distribution": distribution,
-            "total_sessions":       len(all_scores),
-            "by_week":              by_week,
-        }
+            results[key] = {
+                "developer_key":        key,
+                "avg_depth_score":      avg,
+                "depth_label":          _label(avg),
+                "session_distribution": distribution,
+                "total_sessions":       len(all_scores),
+                "by_week":              by_week,
+            }
 
-    return results
+        return results

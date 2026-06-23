@@ -5,9 +5,13 @@ Provides per-session:
   - ai_title       : AI-generated session title (last seen value)
   - agent_names    : unique agent names seen (from agent-name messages)
   - tasks          : list of agent task records (from queue-operation enqueue messages)
+  - background_tasks : list of agent-less enqueues (background/web tasks with no agent_name)
 
 Each task record contains:
   task_id, agent_name, task_description, status, enqueued_at, week
+
+Each background_task record contains:
+  enqueued_at, week
 """
 
 import json
@@ -89,6 +93,7 @@ def _process_jsonl(path: Path, developer_key: str) -> dict:
     agent_name_ts: dict[str, str] = {}  # name → timestamp from agent-name message
     session_start_ts: str | None = None
     tasks: list[dict] = []
+    background_tasks: list[dict] = []
 
     for line in lines:
         line = line.strip()
@@ -132,6 +137,11 @@ def _process_jsonl(path: Path, developer_key: str) -> dict:
             # Only insert if we have an agent name — a task_id alone is not useful
             if parsed.get("agent_name"):
                 tasks.append(parsed)
+            else:
+                background_tasks.append({
+                    "enqueued_at": ts_raw or None,
+                    "week":        _week_label(ts_dt) if ts_dt else None,
+                })
 
     # Agent-name-only entries: agents seen via agent-name msg but not via queue-operation.
     # Use the agent-name message timestamp so week/enqueued_at are never NULL.
@@ -156,15 +166,16 @@ def _process_jsonl(path: Path, developer_key: str) -> dict:
                 "week":             _week_label(ts_dt) if ts_dt else None,
             })
 
-    if not ai_title and not agent_names_seen and not tasks:
+    if not ai_title and not agent_names_seen and not tasks and not background_tasks:
         return {}
 
     return {
-        "session_id":    session_id,
-        "developer_key": developer_key,
-        "ai_title":      ai_title,
-        "agent_names":   agent_names_seen,
-        "tasks":         tasks,
+        "session_id":       session_id,
+        "developer_key":    developer_key,
+        "ai_title":         ai_title,
+        "agent_names":      agent_names_seen,
+        "tasks":            tasks,
+        "background_tasks": background_tasks,
     }
 
 

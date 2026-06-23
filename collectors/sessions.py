@@ -143,6 +143,145 @@ def _process_jsonl(path: Path, developer_key: str) -> list[dict]:
     return events
 
 
+# ── Busy-segment extraction (agent-hours M3, accurate path) ───────────────────
+#
+# The per-turn agent_ms above only measures the gap from a user message to the
+# FIRST assistant reply. That misses tool runtime (assistant→tool_result gaps)
+# and drops whole turns > 10 min. For agent hours we instead build "busy
+# segments": [human_prompt → last agent message before the next human prompt].
+# Everything inside a segment (model thinking, tool execution, sub-agent work)
+# counts; only true human-idle gaps between segments are excluded.
+
+_MAX_GAP_S = 600.0  # 10 min — split a segment here (user walked away mid-turn).
+# Matches the per-turn idle cutoff (_process_jsonl drops gaps > 600_000 ms), so
+# both agent-hours paths use one idle definition. Long tool/sub-agent runs are
+# their own segments (internal gaps stay < 10 min), so this won't truncate them.
+
+
+def _classify(msg: dict) -> str | None:
+    """human = real user prompt, agent = assistant or tool_result, None = ignore."""
+    t = msg.get("type")
+    if t == "assistant":
+        return "agent"
+    if t != "user":
+        return None
+    content = msg.get("message", {}).get("content", "")
+    if isinstance(content, str):
+        return "human" if content.strip() else None
+    if isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return "agent"
+        if any(isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()
+               for b in content):
+            return "human"
+    return None
+
+
+def _segments_from_jsonl(
+    path: Path, developer_key: str, session_id: str, is_sidechain: bool
+) -> list[dict]:
+    """Build busy segments from one JSONL file (main session or sub-agent)."""
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except Exception:
+        return []
+
+    raw_segs: list[tuple[datetime, datetime]] = []
+    cur_start: datetime | None = None
+    last_ts: datetime | None = None
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        kind = _classify(msg)
+        if kind is None:
+            continue
+        ts_raw = msg.get("timestamp")
+        ts = _parse_iso(ts_raw) if ts_raw else None
+        if not ts:
+            continue
+
+        if kind == "human":
+            # Close the previous segment; human-idle gap before this prompt excluded.
+            if cur_start and last_ts and last_ts > cur_start:
+                raw_segs.append((cur_start, last_ts))
+            cur_start, last_ts = ts, ts
+        else:  # agent activity
+            if cur_start is None:
+                cur_start = last_ts = ts
+            else:
+                # Long stall mid-turn → treat as idle, split the segment.
+                if last_ts and (ts - last_ts).total_seconds() > _MAX_GAP_S:
+                    if last_ts > cur_start:
+                        raw_segs.append((cur_start, last_ts))
+                    cur_start = ts
+                last_ts = ts
+
+    if cur_start and last_ts and last_ts > cur_start:
+        raw_segs.append((cur_start, last_ts))
+
+    return [
+        {
+            "session_id":    session_id,
+            "developer_key": developer_key,
+            "start_ts":      s.isoformat(),
+            "end_ts":        e.isoformat(),
+            "is_sidechain":  is_sidechain,
+        }
+        for s, e in raw_segs
+    ]
+
+
+def _too_old(path: Path, since: datetime) -> bool:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc) < since
+    except Exception:
+        return False
+
+
+def collect_segments(
+    developer_map: list[dict],
+    since: datetime | None = None,
+) -> list[dict]:
+    """
+    Busy segments across all claude dirs — primary source for agent hours.
+
+    Includes sub-agent transcripts under <session>/subagents/agent-*.jsonl
+    (tagged is_sidechain=True), which the per-turn collect() does not read.
+    """
+    all_segs: list[dict] = []
+    for dev in developer_map:
+        key = dev["developer_key"]
+        for claude_dir_str in dev["claude_dirs"]:
+            projects_dir = Path(claude_dir_str) / "projects"
+            if not projects_dir.exists():
+                continue
+            for project_dir in projects_dir.iterdir():
+                if not project_dir.is_dir():
+                    continue
+                # main session files
+                for jsonl_file in project_dir.glob("*.jsonl"):
+                    if since and _too_old(jsonl_file, since):
+                        continue
+                    all_segs.extend(
+                        _segments_from_jsonl(jsonl_file, key, jsonl_file.stem, False)
+                    )
+                # sub-agent files: <session>/subagents/agent-*.jsonl
+                for sub_file in project_dir.glob("**/subagents/*.jsonl"):
+                    if since and _too_old(sub_file, since):
+                        continue
+                    parent_session = sub_file.parent.parent.name
+                    all_segs.extend(
+                        _segments_from_jsonl(sub_file, key, parent_session, True)
+                    )
+    return all_segs
+
+
 def collect(
     developer_map: list[dict],
     processed_sessions: set[str] | None = None,
@@ -168,14 +307,17 @@ def collect(
                     continue
                 for jsonl_file in project_dir.glob("*.jsonl"):
                     session_id = jsonl_file.stem
-                    if session_id in processed_sessions:
-                        continue
                     if since:
                         mtime = datetime.fromtimestamp(
                             jsonl_file.stat().st_mtime, tz=timezone.utc
                         )
                         if mtime < since:
                             continue
+                        # File was modified within the window: re-parse even if
+                        # already pushed — active sessions accumulate new turns.
+                    elif session_id in processed_sessions:
+                        # No time window: safe to skip fully-pushed sessions.
+                        continue
                     events = _process_jsonl(jsonl_file, key)
                     all_events.extend(events)
 

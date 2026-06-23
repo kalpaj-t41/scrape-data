@@ -10,6 +10,9 @@ Trajectory slope: linear trend of the team's AI Native Score over the past
 4 weekly snapshots.  Positive = improving, negative = regressing.
 """
 
+from computers.base import ComputeContext, MetricComputer
+from computers.registry import registry
+
 
 def _gini(values: list[float]) -> float:
     """Gini coefficient of a list of non-negative values (Lorenz-curve formula)."""
@@ -38,60 +41,61 @@ def _slope(pairs: list[tuple[str, float]]) -> float | None:
     return round(num / den, 2) if den else 0.0
 
 
-def compute(
-    developer_scores: list[dict],
-    agent_hours_results: dict[str, dict],
-    week: str,
-    weekly_history: list[dict] | None = None,
-) -> dict:
-    """
-    Returns team-level equity and trajectory.
+@registry.register
+class Equity(MetricComputer):
+    name = "equity"
+    phase = "score"
+    deps = ("composite", "agent_hours")
 
-    weekly_history: [{week, team_score}, ...] oldest-first, from MetricsStore.
-    """
-    hours_list = [
-        agent_hours_results.get(d["developer_key"], {})
-        .get("by_week", {})
-        .get(week, {})
-        .get("agent_hours", 0.0)
-        for d in developer_scores
-    ]
+    def compute(self, ctx: ComputeContext) -> dict:
+        developer_scores = ctx.get("composite")
+        agent_hours_results = ctx.get("agent_hours")
+        week = ctx.week
+        weekly_history = ctx.weekly_history
 
-    gini_coeff = _gini(hours_list)
-    equity_label = (
-        "Concentrated"  if gini_coeff > 0.60 else
-        "Uneven"        if gini_coeff > 0.35 else
-        "Distributed"   if gini_coeff > 0.15 else
-        "Equal"
-    )
+        hours_list = [
+            agent_hours_results.get(d["developer_key"], {})
+            .get("by_week", {})
+            .get(week, {})
+            .get("agent_hours", 0.0)
+            for d in developer_scores
+        ]
 
-    # Trajectory: last 4 weeks of team score history
-    slope = None
-    trajectory_label = "Insufficient data"
-    if weekly_history:
-        pairs = [
-            (row["week"], float(row["team_score"]))
-            for row in weekly_history
-            if row.get("team_score") is not None
-        ][-4:]
-        slope = _slope(pairs)
-        if slope is not None:
-            trajectory_label = (
-                "Improving"  if slope > 1.0  else
-                "Regressing" if slope < -1.0 else
-                "Stable"
-            )
+        gini_coeff = _gini(hours_list)
+        equity_label = (
+            "Concentrated"  if gini_coeff > 0.60 else
+            "Uneven"        if gini_coeff > 0.35 else
+            "Distributed"   if gini_coeff > 0.15 else
+            "Equal"
+        )
 
-    mean_h = round(sum(hours_list) / len(hours_list), 2) if hours_list else 0.0
+        # Trajectory: last 4 weeks of team score history
+        slope = None
+        trajectory_label = "Insufficient data"
+        if weekly_history:
+            pairs = [
+                (row["week"], float(row["team_score"]))
+                for row in weekly_history
+                if row.get("team_score") is not None
+            ][-4:]
+            slope = _slope(pairs)
+            if slope is not None:
+                trajectory_label = (
+                    "Improving"  if slope > 1.0  else
+                    "Regressing" if slope < -1.0 else
+                    "Stable"
+                )
 
-    return {
-        "gini_coefficient": gini_coeff,
-        "equity_label": equity_label,
-        "trajectory_slope_per_week": slope,
-        "trajectory_label": trajectory_label,
-        "hours_distribution": {
-            "min":  round(min(hours_list), 2) if hours_list else 0.0,
-            "max":  round(max(hours_list), 2) if hours_list else 0.0,
-            "mean": mean_h,
-        },
-    }
+        mean_h = round(sum(hours_list) / len(hours_list), 2) if hours_list else 0.0
+
+        return {
+            "gini_coefficient": gini_coeff,
+            "equity_label": equity_label,
+            "trajectory_slope_per_week": slope,
+            "trajectory_label": trajectory_label,
+            "hours_distribution": {
+                "min":  round(min(hours_list), 2) if hours_list else 0.0,
+                "max":  round(max(hours_list), 2) if hours_list else 0.0,
+                "mean": mean_h,
+            },
+        }

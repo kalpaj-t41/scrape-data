@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -20,8 +21,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from collectors import discover, session_meta, sessions, facets, app_state, plans, plugins, settings, agent_tasks
+from collectors import discover, session_meta, session_index, sessions, facets, app_state, plans, plugins, settings, agent_tasks
 from central_store import CentralStore
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_since(s: str) -> datetime:
@@ -35,22 +38,22 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     store = CentralStore(central_db)
 
     stats_before = store.stats()
-    print(f"[push] Connecting to central store")
-    print(f"[push] Period  : since {since.date().isoformat()}")
-    print(f"[push] Mode    : {'FORCE (ignoring existing)' if force else 'incremental'}")
-    print(f"[push] DB state before push:")
+    logger.info(f"[push] Connecting to central store")
+    logger.info(f"[push] Period  : since {since.date().isoformat()}")
+    logger.info(f"[push] Mode    : {'FORCE (ignoring existing)' if force else 'incremental'}")
+    logger.info(f"[push] DB state before push:")
     for k, v in stats_before.items():
         if k != "backend":
-            print(f"         {k:<20} {v:>6} rows")
+            logger.info(f"         {k:<20} {v:>6} rows")
 
     # Discover local .claude* dirs and register developers
     developer_map = discover.build_developer_map()
     dev_dirs = [d for dev in developer_map for d in dev["claude_dirs"]]
-    print(f"\n[push] Found {len(developer_map)} developer(s) across {len(dev_dirs)} account(s):")
+    logger.info(f"\n[push] Found {len(developer_map)} developer(s) across {len(dev_dirs)} account(s):")
     for dev in developer_map:
-        print(f"         {dev.get('name') or 'unknown'} <{dev.get('email') or 'no email'}>")
+        logger.info(f"         {dev.get('name') or 'unknown'} <{dev.get('email') or 'no email'}>")
         for d in dev["claude_dirs"]:
-            print(f"           {d}")
+            logger.info(f"           {d}")
 
     if not dry_run:
         store.upsert_developers(developer_map)
@@ -60,26 +63,37 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     already_te  = set() if force else store.pushed_turn_session_ids()
     already_at  = set() if force else store.pushed_agent_session_ids()
 
-    print(f"\n[push] Skipping: {len(already_sm)} session_metas, "
-          f"{len(already_te)} turn-event sessions, "
-          f"{len(already_at)} agent-task sessions already in store")
+    logger.info(f"\n[push] Skipping: {len(already_sm)} session_metas, "
+                f"{len(already_te)} turn-event sessions, "
+                f"{len(already_at)} agent-task sessions already in store")
 
     # ── Collect ──────────────────────────────────────────────────────────────
-    print("\n[push] Collecting session metadata...")
+    logger.info("\n[push] Collecting session metadata...")
     raw_session_metas = session_meta.collect(developer_map, since=since)
-    new_metas = [m for m in raw_session_metas if m["session_id"] not in already_sm]
-    print(f"         {len(raw_session_metas)} found, {len(new_metas)} new")
+    # JSONL is the source of truth (usage-data has coverage gaps); telemetry only fills
+    # orphan sessions + fields JSONL can't derive. Re-push with --force to refresh the
+    # sessions already stored under the old telemetry-primary scheme.
+    jsonl_sessions = session_index.collect(developer_map, since=since)
+    union_metas = session_index.merge_jsonl_primary(jsonl_sessions, raw_session_metas)
+    new_metas = [m for m in union_metas if m["session_id"] not in already_sm]
+    logger.info(f"         {len(jsonl_sessions)} JSONL (primary), {len(raw_session_metas)} telemetry, "
+                f"{len(union_metas)} union, {len(new_metas)} new")
 
-    print("[push] Parsing JSONL transcripts...")
+    logger.info("[push] Parsing JSONL transcripts...")
     raw_turn_events = sessions.collect(
         developer_map,
         processed_sessions=already_te,
         since=since,
     )
     new_te_sessions = len({e["session_id"] for e in raw_turn_events})
-    print(f"         {len(raw_turn_events)} turn events across {new_te_sessions} new sessions")
+    logger.info(f"         {len(raw_turn_events)} turn events across {new_te_sessions} new sessions")
 
-    print("[push] Collecting facets, app state, plans, agent tasks...")
+    logger.info("[push] Building busy segments (accurate agent hours)...")
+    raw_busy_segments = sessions.collect_segments(developer_map, since=since)
+    seg_sessions = len({s["session_id"] for s in raw_busy_segments})
+    logger.info(f"         {len(raw_busy_segments)} segments across {seg_sessions} sessions")
+
+    logger.info("[push] Collecting facets, app state, plans, agent tasks...")
     raw_facets      = facets.collect(developer_map)
     raw_app_state   = app_state.collect(developer_map)
     raw_plans       = plans.collect(developer_map)
@@ -88,12 +102,13 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     settings.collect(developer_map)
 
     task_count = sum(len(v.get("tasks", [])) for v in raw_agent_tasks.values())
-    print(f"         {len(raw_facets)} facets, {len(raw_app_state)} app states, "
-          f"{len(raw_agent_tasks)} agent sessions ({task_count} tasks)")
+    logger.info(f"         {len(raw_facets)} facets, {len(raw_app_state)} app states, "
+                f"{len(raw_agent_tasks)} agent sessions ({task_count} tasks)")
 
     raw = {
         "session_metas": new_metas,
         "turn_events":   raw_turn_events,
+        "busy_segments": raw_busy_segments,
         "facets":        raw_facets,
         "app_state":     raw_app_state,
         "plans":         raw_plans,
@@ -101,16 +116,17 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     }
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    print("\n[push] To be pushed:")
-    print(f"         session_metas  : {len(new_metas)}")
-    print(f"         turn_events    : {len(raw_turn_events)}")
-    print(f"         facets         : {len(raw_facets)}")
-    print(f"         app_state      : {len(raw_app_state)}")
-    print(f"         plans          : {len(raw_plans)}")
-    print(f"         agent_tasks    : {task_count}")
+    logger.info("\n[push] To be pushed:")
+    logger.info(f"         session_metas  : {len(new_metas)}")
+    logger.info(f"         turn_events    : {len(raw_turn_events)}")
+    logger.info(f"         busy_segments  : {len(raw_busy_segments)}")
+    logger.info(f"         facets         : {len(raw_facets)}")
+    logger.info(f"         app_state      : {len(raw_app_state)}")
+    logger.info(f"         plans          : {len(raw_plans)}")
+    logger.info(f"         agent_tasks    : {task_count}")
 
     if dry_run:
-        print("\n[push] DRY RUN — nothing written.")
+        logger.info("\n[push] DRY RUN — nothing written.")
         store.close()
         return
 
@@ -119,24 +135,27 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     store.close()
 
     stats_delta = {
-        "session_metas": inserted["session_metas"],
-        "turn_events":   inserted["turn_events"],
-        "facets":        inserted["facets"],
-        "app_state":     inserted["app_state"],
-        "plans":         inserted["plans"],
-        "agent_tasks":   inserted["agent_tasks"],
+        "session_metas": inserted.get("session_metas", 0),
+        "turn_events":   inserted.get("turn_events", 0),
+        "busy_segments": inserted.get("busy_segments", 0),
+        "facets":        inserted.get("facets", 0),
+        "app_state":     inserted.get("app_state", 0),
+        "plans":         inserted.get("plans", 0),
+        "agent_tasks":   inserted.get("agent_tasks", 0),
     }
 
-    print("\n[push] Done.")
-    print(f"  {'Table':<22} {'Before':>8} {'Inserted':>10} {'After':>8}")
-    print("  " + "-" * 52)
+    logger.info("\n[push] Done.")
+    logger.info(f"  {'Table':<22} {'Before':>8} {'Inserted':>10} {'After':>8}")
+    logger.info("  " + "-" * 52)
     for k, before in stats_before.items():
         if k in stats_delta:
             after = before + stats_delta[k]
-            print(f"  {k:<22} {before:>8} {stats_delta[k]:>10} {after:>8}")
+            logger.info(f"  {k:<22} {before:>8} {stats_delta[k]:>10} {after:>8}")
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     parser = argparse.ArgumentParser(description="Push local Claude data to central store")
     parser.add_argument("--central", default=None,
                         help="SQLite path or PostgreSQL URL. "
@@ -151,7 +170,7 @@ def main():
 
     target = args.central or os.environ.get("POSTGRES_URL")
     if not target:
-        print("Error: provide --central <path/url> or set POSTGRES_URL env var")
+        logger.error("Error: provide --central <path/url> or set POSTGRES_URL env var")
         raise SystemExit(1)
 
     push(
