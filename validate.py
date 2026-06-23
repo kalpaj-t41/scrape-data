@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import re
 import sys
 from collections import defaultdict
@@ -34,6 +35,7 @@ PASS = "\033[92mPASS\033[0m"
 FAIL = "\033[91mFAIL\033[0m"
 WARN = "\033[93mWARN\033[0m"
 
+logger = logging.getLogger(__name__)
 results: list[tuple[str, bool, str]] = []  # (label, passed, detail)
 
 
@@ -45,17 +47,17 @@ def check(label: str, actual, expected, tol: float = 0.01, unit: str = "") -> No
     detail = f"got {actual}{unit}  expected {expected}{unit}"
     results.append((label, passed, detail))
     tag = PASS if passed else FAIL
-    print(f"  [{tag}] {label}: {detail}")
+    logger.info(f"  [{tag}] {label}: {detail}")
 
 
 def warn(label: str, msg: str) -> None:
     results.append((label, None, msg))
-    print(f"  [{WARN}] {label}: {msg}")
+    logger.warning(f"  [{WARN}] {label}: {msg}")
 
 
 def validate_registry() -> None:
     """Layer 0: compute-layer registry wiring (independent of data)."""
-    print("\n── Layer 0: Compute-layer registry ──────────────────────────────────")
+    logger.info("\n── Layer 0: Compute-layer registry ──────────────────────────────────")
 
     expected = {"adoption", "agent_hours", "parallel_agents", "depth", "harness",
                 "skills", "trust", "outcomes", "velocity", "consistency",
@@ -272,6 +274,8 @@ def scan_session_metas(claude_dirs: list[Path], since: datetime | None) -> dict:
 # ── main validation ────────────────────────────────────────────────────────────
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--since", default=None,
                         help="e.g. 7d or 2026-01-01 (default: all data)")
@@ -287,11 +291,11 @@ def main():
         else:
             since = datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
 
-    print("\n" + "=" * 68)
-    print("  E2E METRICS VALIDATION")
+    logger.info("\n" + "=" * 68)
+    logger.info("  E2E METRICS VALIDATION")
     if since:
-        print(f"  Period: since {since.date()}")
-    print("=" * 68 + "\n")
+        logger.info(f"  Period: since {since.date()}")
+    logger.info("=" * 68 + "\n")
 
     # ── Layer 0: registry wiring (no data needed) ──────────────────────────────
     validate_registry()
@@ -299,25 +303,25 @@ def main():
     # ── discover ──────────────────────────────────────────────────────────────
     developer_map = discover.build_developer_map()
     claude_dirs   = [Path(d) for dev in developer_map for d in dev["claude_dirs"]]
-    print(f"Developers found  : {len(developer_map)}")
-    print(f"Claude dirs       : {len(claude_dirs)}")
+    logger.info(f"Developers found  : {len(developer_map)}")
+    logger.info(f"Claude dirs       : {len(claude_dirs)}")
 
     # ── ground truth ─────────────────────────────────────────────────────────
-    print("\n[Computing ground truth from raw files...]\n")
+    logger.info("\n[Computing ground truth from raw files...]\n")
     gt_jsonl = scan_jsonl(claude_dirs, since)
     gt_sm    = scan_session_metas(claude_dirs, since)
 
-    print(f"  GT sessions (session-meta files) : {gt_sm['session_count']}")
-    print(f"  GT turns    (JSONL user→asst)    : {gt_jsonl['turns']}")
-    print(f"  GT agent_ms (sum timestamp diff) : {gt_jsonl['agent_ms']:.0f} ms  "
-          f"({gt_jsonl['agent_ms']/3_600_000:.3f} hrs)")
-    print(f"  GT skills   (local_command msgs) : {gt_jsonl['skills']}")
-    print(f"  GT agents   (unique agent names) : {len(gt_jsonl['agent_names'])}")
-    print(f"  GT lines    (added + int(removed*0.5) per session): "
-          f"{gt_sm['total_lines_weighted']}")
+    logger.info(f"  GT sessions (session-meta files) : {gt_sm['session_count']}")
+    logger.info(f"  GT turns    (JSONL user→asst)    : {gt_jsonl['turns']}")
+    logger.info(f"  GT agent_ms (sum timestamp diff) : {gt_jsonl['agent_ms']:.0f} ms  "
+                f"({gt_jsonl['agent_ms']/3_600_000:.3f} hrs)")
+    logger.info(f"  GT skills   (local_command msgs) : {gt_jsonl['skills']}")
+    logger.info(f"  GT agents   (unique agent names) : {len(gt_jsonl['agent_names'])}")
+    logger.info(f"  GT lines    (added + int(removed*0.5) per session): "
+                f"{gt_sm['total_lines_weighted']}")
 
     # ── run collectors ────────────────────────────────────────────────────────
-    print("\n[Running collectors...]\n")
+    logger.info("\n[Running collectors...]\n")
     raw_sm  = session_meta.collect(developer_map, since=since)
     raw_te  = sessions.collect(developer_map, since=since)
     raw_seg = sessions.collect_segments(developer_map, since=since)
@@ -334,14 +338,14 @@ def main():
                            if t.get("agent_name")}
     col_agent_names = len(col_agent_names_set)
 
-    print(f"  COL sessions   : {col_sessions}")
-    print(f"  COL turns      : {col_turns}")
-    print(f"  COL agent_ms   : {col_agent_ms:.0f} ms  ({col_agent_ms/3_600_000:.3f} hrs)")
-    print(f"  COL skills     : {col_skills}")
-    print(f"  COL agent names: {col_agent_names}")
+    logger.info(f"  COL sessions   : {col_sessions}")
+    logger.info(f"  COL turns      : {col_turns}")
+    logger.info(f"  COL agent_ms   : {col_agent_ms:.0f} ms  ({col_agent_ms/3_600_000:.3f} hrs)")
+    logger.info(f"  COL skills     : {col_skills}")
+    logger.info(f"  COL agent names: {col_agent_names}")
 
     # ── LAYER 1: collector vs ground truth ───────────────────────────────────
-    print("\n── Layer 1: Collector accuracy ──────────────────────────────────────")
+    logger.info("\n── Layer 1: Collector accuracy ──────────────────────────────────────")
     check("Session count (session-meta vs gt)",
           col_sessions, gt_sm["session_count"])
     check("Turn count (collector vs gt JSONL)",
@@ -358,7 +362,7 @@ def main():
           unit=f"  [col={col_agent_names} gt={len(gt_jsonl['agent_names'])} missing={missing_in_col}]")
 
     # ── run computers ─────────────────────────────────────────────────────────
-    print("\n[Running computers...]\n")
+    logger.info("\n[Running computers...]\n")
     from collections import defaultdict
     sessions_by_dev: dict = defaultdict(list)
     meta_by_sid: dict     = {}
@@ -381,7 +385,7 @@ def main():
     trust_result   = trust.compute(sessions_by_dev, turns_by_session)
 
     # ── LAYER 1b: Agent-hours segments (wallclock vs labor) ──────────────────
-    print("\n── Layer 1b: Agent-hours busy segments ──────────────────────────────")
+    logger.info("\n── Layer 1b: Agent-hours busy segments ──────────────────────────────")
 
     # Well-formed: every emitted segment must have end > start.
     bad_segs = sum(
@@ -430,7 +434,7 @@ def main():
          f"{n_sidechain} sidechain segments  max weekly parallelism={max_parallel}")
 
     # ── LAYER 2: computer vs collector raw ───────────────────────────────────
-    print("── Layer 2: Computer vs collector raw data ──────────────────────────")
+    logger.info("── Layer 2: Computer vs collector raw data ──────────────────────────")
 
     # Agent hours: computer total >= collector total is expected because the fallback
     # path adds estimated hours for sessions present in session-meta but not in JSONL.
@@ -483,7 +487,7 @@ def main():
             check(f"Trust interruption_rate in [0,1] ({dev_key[:8]})", True, True)
 
     # ── LAYER 3: ground truth vs computer ────────────────────────────────────
-    print("\n── Layer 3: Computer vs ground truth (JSONL) ────────────────────────")
+    logger.info("\n── Layer 3: Computer vs ground truth (JSONL) ────────────────────────")
 
     # Agent hours by week: computer can exceed GT because the fallback path adds
     # estimated hours (session_duration - user_idle) for sessions with no JSONL turns.
@@ -509,7 +513,7 @@ def main():
           comp_skills_alltime, gt_jsonl["skills"])
 
     # ── LAYER 4: internal consistency ────────────────────────────────────────
-    print("\n── Layer 4: Internal consistency ────────────────────────────────────")
+    logger.info("\n── Layer 4: Internal consistency ────────────────────────────────────")
 
     # Every turn event must have either agent_ms set or a reason it's None
     turns_only    = [e for e in raw_te if "user_ts" in e]
@@ -551,7 +555,7 @@ def main():
 
     # ── Layer 5: Store completeness (--from-store only) ──────────────────────
     if args.from_store:
-        print("\n── Layer 5: Store completeness (local JSONL → DB) ────────────────")
+        logger.info("\n── Layer 5: Store completeness (local JSONL → DB) ────────────────")
         from central_store import CentralStore as _CentralStore
         store = _CentralStore(args.from_store)
         is_pg = str(args.from_store).startswith(("postgresql://", "postgres://"))
@@ -653,12 +657,12 @@ def main():
         store.close()
 
     # ── summary ───────────────────────────────────────────────────────────────
-    print("\n" + "=" * 68)
+    logger.info("\n" + "=" * 68)
     passed = sum(1 for _, p, _ in results if p is True)
     failed = sum(1 for _, p, _ in results if p is False)
     warned = sum(1 for _, p, _ in results if p is None)
-    print(f"  RESULT: {passed} passed  {failed} failed  {warned} warnings")
-    print("=" * 68 + "\n")
+    logger.info(f"  RESULT: {passed} passed  {failed} failed  {warned} warnings")
+    logger.info("=" * 68 + "\n")
     if failed:
         sys.exit(1)
 

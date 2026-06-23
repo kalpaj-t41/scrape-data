@@ -13,6 +13,7 @@ Usage:
 """
 
 import json
+import logging
 import os
 import sys
 from datetime import datetime
@@ -22,6 +23,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from central_store import CentralStore
 from collectors.sessions import _extract_user_text, _parse_iso
+
+logger = logging.getLogger(__name__)
 
 
 def _build_jsonl_index() -> dict[str, Path]:
@@ -76,16 +79,15 @@ def backfill(db_url: str) -> None:
         ORDER BY session_id
     """)
 
-    print(f"Sessions to backfill: {len(rows)}")
+    logger.info(f"Sessions to backfill: {len(rows)}")
     if not rows:
-        print("Nothing to do.")
+        logger.info("Nothing to do.")
         cs.close()
         return
 
-    print("Building JSONL index from ~/.claude* ...")
+    logger.info("Building JSONL index from ~/.claude* ...")
     jsonl_index = _build_jsonl_index()
-    print(f"  {len(jsonl_index)} JSONL files indexed")
-    print()
+    logger.info(f"  {len(jsonl_index)} JSONL files indexed")
 
     total_updated = 0
     total_skipped = 0
@@ -93,13 +95,13 @@ def backfill(db_url: str) -> None:
     for (session_id,) in rows:
         jsonl_path = jsonl_index.get(session_id)
         if not jsonl_path:
-            print(f"  [{session_id[:8]}] JSONL not found — skipping")
+            logger.info(f"  [{session_id[:8]}] JSONL not found — skipping")
             total_skipped += 1
             continue
 
         prompt_map = _build_prompt_map(jsonl_path)
         if not prompt_map:
-            print(f"  [{session_id[:8]}] no user text found — skipping")
+            logger.info(f"  [{session_id[:8]}] no user text found — skipping")
             total_skipped += 1
             continue
 
@@ -122,17 +124,17 @@ def backfill(db_url: str) -> None:
 
         cs._conn.commit()
         total_updated += session_updated
-        print(f"  [{session_id[:8]}] updated {session_updated} / {len(prompt_map)} turns")
+        logger.info(f"  [{session_id[:8]}] updated {session_updated} / {len(prompt_map)} turns")
 
-    print()
-    print(f"Done.  turns backfilled: {total_updated}  sessions skipped: {total_skipped}")
+    logger.info(f"Done.  turns backfilled: {total_updated}  sessions skipped: {total_skipped}")
     cs.close()
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     url = (sys.argv[1] if len(sys.argv) > 1 else None) or os.environ.get("POSTGRES_URL")
     if not url:
-        print("Usage: python backfill_prompts.py postgresql://user:pass@host/db")
-        print("       or set POSTGRES_URL env var")
+        logger.error("Usage: python backfill_prompts.py postgresql://user:pass@host/db")
+        logger.error("       or set POSTGRES_URL env var")
         sys.exit(1)
     backfill(url)

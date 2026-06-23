@@ -12,10 +12,13 @@ Output schema:
 
 import hashlib
 import json
+import logging
 import os
 import socket
 import subprocess
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _sha256(value: str) -> str:
@@ -151,5 +154,6 @@ def build_developer_map(home: Path | None = None) -> list[dict]:
 
 if __name__ == "__main__":
     import json as _json
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     for dev in build_developer_map():
-        print(_json.dumps(dev, indent=2))
+        logger.info(_json.dumps(dev, indent=2))

@@ -224,6 +224,7 @@ CREATE TABLE IF NOT EXISTS scrape_data.plans (
 
 ALTER TABLE scrape_data.session_metas ADD COLUMN IF NOT EXISTS ai_title    TEXT;
 ALTER TABLE scrape_data.session_metas ADD COLUMN IF NOT EXISTS agent_names JSONB DEFAULT '[]';
+ALTER TABLE scrape_data.session_metas ADD COLUMN IF NOT EXISTS source      TEXT;
 
 CREATE TABLE IF NOT EXISTS scrape_data.agent_tasks (
     id               BIGSERIAL PRIMARY KEY,
@@ -237,6 +238,16 @@ CREATE TABLE IF NOT EXISTS scrape_data.agent_tasks (
     week             TEXT,
     pushed_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS scrape_data.background_tasks (
+    id            BIGSERIAL PRIMARY KEY,
+    session_id    TEXT NOT NULL,
+    developer_key TEXT NOT NULL,
+    enqueued_at   TIMESTAMPTZ,
+    week          TEXT,
+    pushed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_bt_sid ON scrape_data.background_tasks(session_id);
 
 CREATE INDEX IF NOT EXISTS idx_sm_dev   ON scrape_data.session_metas(developer_key);
 CREATE INDEX IF NOT EXISTS idx_sm_week  ON scrape_data.session_metas(week);
@@ -601,7 +612,7 @@ class _PostgresStore:
         from psycopg2.extras import Json, execute_values
 
         now = datetime.now(tz=timezone.utc)
-        inserted = {"session_metas": 0, "turn_events": 0, "facets": 0, "app_state": 0, "plans": 0, "agent_tasks": 0, "busy_segments": 0}
+        inserted = {"session_metas": 0, "turn_events": 0, "facets": 0, "app_state": 0, "plans": 0, "agent_tasks": 0, "background_tasks": 0, "busy_segments": 0}
         cur = self._conn.cursor()
 
         # In force mode, delete existing rows for all incoming sessions before re-inserting
@@ -617,6 +628,7 @@ class _PostgresStore:
                 sid_list = list(all_sids)
                 cur.execute("DELETE FROM scrape_data.turn_events  WHERE session_id = ANY(%s)", (sid_list,))
                 cur.execute("DELETE FROM scrape_data.agent_tasks  WHERE session_id = ANY(%s)", (sid_list,))
+                cur.execute("DELETE FROM scrape_data.background_tasks WHERE session_id = ANY(%s)", (sid_list,))
                 cur.execute("DELETE FROM scrape_data.busy_segments WHERE session_id = ANY(%s)", (sid_list,))
                 cur.execute("DELETE FROM scrape_data.facets       WHERE session_id = ANY(%s)", (sid_list,))
                 cur.execute("DELETE FROM scrape_data.session_metas WHERE session_id = ANY(%s)", (sid_list,))
@@ -656,6 +668,7 @@ class _PostgresStore:
                 Json(meta.get("tool_counts") or {}),
                 Json(meta.get("languages") or {}),
                 Json(meta.get("user_response_times") or []),
+                meta.get("source"),
                 now,
             ))
         if sm_rows:
@@ -670,7 +683,7 @@ class _PostgresStore:
                     first_prompt, user_interruptions, tool_errors,
                     uses_task_agent, uses_mcp, uses_web_search, uses_web_fetch,
                     input_tokens, output_tokens,
-                    tool_counts, languages, user_response_times, pushed_at
+                    tool_counts, languages, user_response_times, source, pushed_at
                 ) VALUES %s ON CONFLICT (session_id) DO NOTHING
                 """,
                 sm_rows,
@@ -899,6 +912,26 @@ class _PostgresStore:
             )
             inserted["agent_tasks"] = len(at_rows)
 
+        # ── background_tasks — agent-less queue-operation enqueues (harness M7) ──
+        bt_rows = []
+        for session_id, at_data in raw.get("agent_tasks", {}).items():
+            if session_id in existing_at:
+                continue
+            dev_key = at_data.get("developer_key", "")
+            for bt in at_data.get("background_tasks", []) or []:
+                bt_rows.append((session_id, dev_key, bt.get("enqueued_at"), bt.get("week"), now))
+        if bt_rows:
+            execute_values(
+                cur,
+                """
+                INSERT INTO scrape_data.background_tasks (
+                    session_id, developer_key, enqueued_at, week, pushed_at
+                ) VALUES %s
+                """,
+                bt_rows,
+            )
+            inserted["background_tasks"] = len(bt_rows)
+
         # ── busy_segments — session-level replace (reparse is authoritative) ──
         seg_rows = []
         seg_sids = set()
@@ -1098,6 +1131,21 @@ class _PostgresStore:
                     "enqueued_at":      enq.isoformat() if hasattr(enq, "isoformat") else enq,
                 })
 
+            # background_tasks — agent-less enqueues (harness M7 background component)
+            for row in self._fetchall(
+                f"SELECT session_id, developer_key, enqueued_at, week "
+                f"FROM scrape_data.background_tasks WHERE session_id IN ({ph})",
+                args,
+            ):
+                sid = row[0]
+                if sid not in agent_tasks_result:
+                    agent_tasks_result[sid] = {"developer_key": row[1], "tasks": []}
+                enq = row[2]
+                agent_tasks_result[sid].setdefault("background_tasks", []).append({
+                    "enqueued_at": enq.isoformat() if hasattr(enq, "isoformat") else enq,
+                    "week":        row[3],
+                })
+
         # busy_segments — accurate agent-hours source. Not gated by session_metas:
         # segments carry developer_key + start_ts, so JSONL-only sessions still count.
         busy_segments: list[dict] = []
@@ -1136,6 +1184,7 @@ class _PostgresStore:
             "app_state":     self._fetchall("SELECT COUNT(*) FROM scrape_data.app_state")[0][0],
             "plans":         self._fetchall("SELECT COUNT(*) FROM scrape_data.plans")[0][0],
             "agent_tasks":   self._fetchall("SELECT COUNT(*) FROM scrape_data.agent_tasks")[0][0],
+            "background_tasks": self._fetchall("SELECT COUNT(*) FROM scrape_data.background_tasks")[0][0],
             "busy_segments": self._fetchall("SELECT COUNT(*) FROM scrape_data.busy_segments")[0][0],
             "developers":    self._fetchall(
                 "SELECT COUNT(DISTINCT developer_key) FROM scrape_data.session_metas"
