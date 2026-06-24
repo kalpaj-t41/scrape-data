@@ -86,11 +86,16 @@ class Equity(MetricComputer):
                     "Stable"
                 )
 
-        mean_h = round(sum(hours_list) / len(hours_list), 2) if hours_list else 0.0
+        total_h = sum(hours_list)
+        mean_h = round(total_h / len(hours_list), 2) if hours_list else 0.0
+        # Top-1 share (U6/R15): fraction of the team's weekly agent hours produced by
+        # the single busiest developer. 1.0 = one person carries all the AI work.
+        top_1_share = round(max(hours_list) / total_h, 3) if total_h > 0 else 0.0
 
         return {
             "gini_coefficient": gini_coeff,
             "equity_label": equity_label,
+            "top_1_share": top_1_share,
             "trajectory_slope_per_week": slope,
             "trajectory_label": trajectory_label,
             "hours_distribution": {

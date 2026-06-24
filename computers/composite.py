@@ -196,6 +196,7 @@ class Composite(MetricComputer):
         if equity_data:
             result["gini_coefficient"]   = equity_data.get("gini_coefficient")
             result["equity_label"]       = equity_data.get("equity_label")
+            result["top_1_share"]        = equity_data.get("top_1_share")
             result["trajectory_slope"]   = equity_data.get("trajectory_slope_per_week")
             result["trajectory_label"]   = equity_data.get("trajectory_label")
             result["hours_distribution"] = equity_data.get("hours_distribution")
