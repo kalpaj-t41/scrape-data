@@ -18,7 +18,9 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from collectors.sessions import _signals_from_jsonl, collect_segments  # noqa: E402
+from collectors.sessions import (  # noqa: E402
+    _signals_from_jsonl, _read_agent_meta, collect_segments,
+)
 
 
 def _write_jsonl(msgs: list[dict]) -> Path:
@@ -246,6 +248,69 @@ def test_no_patch_means_zero_churn():
         _tool_result("2026-06-24T13:00:06Z", "t1", {"stdout": "files"}),
     ])
     assert recs[0]["churn"] == {"added": 0, "survived": 0, "reverted": 0}, recs[0]["churn"]
+
+
+def test_agent_identity_defaults_to_main():
+    """Main-session records default agent_kind='main' and agent_id == session_id."""
+    recs = _parse([
+        _human("2026-06-24T10:00:00Z"),
+        _tool_use("2026-06-24T10:00:05Z", "t1", "Bash", {"command": "ls"}),
+        _tool_result("2026-06-24T10:00:06Z", "t1", {"stdout": "x"}),
+    ])
+    r = recs[0]
+    assert r["agent_kind"] == "main" and r["agent_id"] == "S1", r
+    assert r["agent_type"] is None and r["workflow_run_id"] is None
+
+
+def test_agent_identity_stamped_for_subagent():
+    """Sub-agent records carry agent_kind/agent_id/agent_type while keeping the
+    parent session_id and developer_key (rollup to the developer stays intact)."""
+    path = _write_jsonl([
+        _human("2026-06-24T10:00:00Z"),
+        _tool_use("2026-06-24T10:00:05Z", "t1", "Bash", {"command": "ls"}),
+        _tool_result("2026-06-24T10:00:06Z", "t1", {"stdout": "x"}),
+    ])
+    try:
+        recs = _signals_from_jsonl(path, "dev1", "parentS", True,
+                                   agent_kind="subagent", agent_id="agent-abc",
+                                   agent_type="Explore", spawn_tool_use_id="tu_9")
+    finally:
+        path.unlink(missing_ok=True)
+    r = recs[0]
+    assert r["agent_kind"] == "subagent" and r["agent_id"] == "agent-abc"
+    assert r["agent_type"] == "Explore" and r["spawn_tool_use_id"] == "tu_9"
+    assert r["session_id"] == "parentS" and r["developer_key"] == "dev1"
+    assert r["is_sidechain"] is True
+
+
+def test_agent_identity_workflow_run_id():
+    """Workflow sub-agent records carry workflow_run_id."""
+    path = _write_jsonl([
+        _human("2026-06-24T10:00:00Z"),
+        _tool_use("2026-06-24T10:00:05Z", "t1", "Bash", {"command": "ls"}),
+        _tool_result("2026-06-24T10:00:06Z", "t1", {"stdout": "x"}),
+    ])
+    try:
+        recs = _signals_from_jsonl(path, "dev1", "parentS", True,
+                                   agent_kind="workflow", agent_id="agent-w",
+                                   workflow_run_id="wf_run_1")
+    finally:
+        path.unlink(missing_ok=True)
+    assert recs[0]["agent_kind"] == "workflow" and recs[0]["workflow_run_id"] == "wf_run_1"
+
+
+def test_read_agent_meta():
+    """Sibling agent-<id>.meta.json is read; missing meta returns {}."""
+    import json as _json
+    from pathlib import Path as _Path
+    d = _Path(tempfile.mkdtemp())
+    jp = d / "agent-xyz.jsonl"
+    jp.write_text("{}\n")
+    (d / "agent-xyz.meta.json").write_text(
+        _json.dumps({"agentType": "code-reviewer", "toolUseId": "tu_1"}))
+    meta = _read_agent_meta(jp)
+    assert meta.get("agentType") == "code-reviewer" and meta.get("toolUseId") == "tu_1"
+    assert _read_agent_meta(d / "agent-none.jsonl") == {}
 
 
 # Discovered: collect_segments is imported to keep the module-level contract in view;

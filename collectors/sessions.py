@@ -394,6 +394,19 @@ def _msg_interrupted(msg: dict) -> bool:
     return bool(tur.get("interrupted")) if isinstance(tur, dict) else False
 
 
+def _read_agent_meta(jsonl_path: Path) -> dict:
+    """Read the sibling `agent-<id>.meta.json` ({agentType, description, toolUseId})
+    written next to an Agent-tool / workflow sub-agent transcript (U11). Returns {}
+    when absent or unreadable — best-effort, never raises."""
+    try:
+        meta_path = jsonl_path.with_suffix(".meta.json")
+        if meta_path.exists():
+            return json.loads(meta_path.read_text(errors="replace")) or {}
+    except Exception:
+        pass
+    return {}
+
+
 def _patch_lines(msg: dict) -> tuple[str | None, list[str], list[str]]:
     """(filePath, added_lines, removed_lines) from the toolUseResult.structuredPatch
     of an edit tool result (U3 churn). structuredPatch lives on toolUseResult."""
@@ -425,7 +438,10 @@ def _result_blocks(msg: dict) -> list[tuple[str, bool]]:
 
 
 def _signals_from_jsonl(
-    path: Path, developer_key: str, session_id: str, is_sidechain: bool
+    path: Path, developer_key: str, session_id: str, is_sidechain: bool,
+    agent_kind: str = "main", agent_id: str | None = None,
+    agent_type: str | None = None, workflow_run_id: str | None = None,
+    spawn_tool_use_id: str | None = None,
 ) -> list[dict]:
     """Build per-segment tool-call signal records from one JSONL file.
 
@@ -565,6 +581,11 @@ def _signals_from_jsonl(
         records.append({
             "session_id":         session_id,
             "developer_key":      developer_key,
+            "agent_kind":         agent_kind,
+            "agent_id":           agent_id or session_id,
+            "agent_type":         agent_type,
+            "workflow_run_id":    workflow_run_id,
+            "spawn_tool_use_id":  spawn_tool_use_id,
             "start_ts":           s.isoformat(),
             "end_ts":             e.isoformat(),
             "is_sidechain":       is_sidechain,
@@ -596,23 +617,33 @@ def collect_segment_signals(
                 for jsonl_file in project_dir.glob("*.jsonl"):
                     if since and _too_old(jsonl_file, since):
                         continue
-                    all_sigs.extend(
-                        _signals_from_jsonl(jsonl_file, key, jsonl_file.stem, False)
-                    )
+                    all_sigs.extend(_signals_from_jsonl(
+                        jsonl_file, key, jsonl_file.stem, False,
+                        agent_kind="main", agent_id=jsonl_file.stem,
+                    ))
                 for sub_file in project_dir.glob("*/subagents/*.jsonl"):
                     if since and _too_old(sub_file, since):
                         continue
-                    all_sigs.extend(
-                        _signals_from_jsonl(sub_file, key, sub_file.parent.parent.name, True)
-                    )
+                    meta = _read_agent_meta(sub_file)
+                    all_sigs.extend(_signals_from_jsonl(
+                        sub_file, key, sub_file.parent.parent.name, True,
+                        agent_kind="subagent", agent_id=sub_file.stem,
+                        agent_type=meta.get("agentType"),
+                        spawn_tool_use_id=meta.get("toolUseId"),
+                    ))
                 for wf_file in project_dir.glob("*/subagents/workflows/*/*.jsonl"):
                     if wf_file.stem in _WF_SKIP_STEMS:
                         continue
                     if since and _too_old(wf_file, since):
                         continue
-                    all_sigs.extend(
-                        _signals_from_jsonl(wf_file, key, wf_file.parents[3].name, True)
-                    )
+                    meta = _read_agent_meta(wf_file)
+                    all_sigs.extend(_signals_from_jsonl(
+                        wf_file, key, wf_file.parents[3].name, True,
+                        agent_kind="workflow", agent_id=wf_file.stem,
+                        workflow_run_id=wf_file.parent.name,
+                        agent_type=meta.get("agentType"),
+                        spawn_tool_use_id=meta.get("toolUseId"),
+                    ))
     return all_sigs
 
 

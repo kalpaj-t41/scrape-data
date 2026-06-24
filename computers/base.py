@@ -33,7 +33,8 @@ class ComputeContext:
     agent_tasks:      dict
 
     # ── per-tool-call signal stream (U1: efficiency/usefulness/QAAH backbone) ──
-    # One record per busy segment: {session_id, developer_key, start_ts, end_ts,
+    # One record per busy segment: {session_id, developer_key, agent_kind,
+    # agent_id, agent_type, workflow_run_id, spawn_tool_use_id, start_ts, end_ts,
     # is_sidechain, tool_calls: [{name, target, is_error, interrupted, ts}],
     # verification: [{kind, passed, ts}], churn: {added, survived, reverted},
     # ended_in_interrupt}. Empty when not collected (daily-only / pre-signal store).
