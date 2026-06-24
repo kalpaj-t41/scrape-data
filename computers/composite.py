@@ -65,6 +65,7 @@ def _score_developer(
     outcomes_data: dict,
     velocity_data: dict,
     consistency_data: dict | None,
+    qaah_data: dict | None,
     week: str | None,
 ) -> dict:
     adoption_score = adoption_data.get("adoption_index", 0.0)
@@ -76,7 +77,19 @@ def _score_developer(
             (v.get("agent_hours", 0.0) for v in agent_hours_data.get("by_week", {}).values()),
             default=0.0,
         )
-    agent_hours_score = _normalize_agent_hours(hours)
+
+    # Quantity dimension = Quality-Adjusted Agent Hours (KTD1: cap hours to the 80-hr
+    # target FIRST, then discount by efficiency × usefulness). When the week's QAAH is
+    # low-confidence (coverage below threshold) we fall back to quantity-only so thin
+    # signal never moves the headline (KTD5). The _WEIGHTS key stays "agent_hours".
+    norm_hours = _normalize_agent_hours(hours)
+    qw = (qaah_data or {}).get("by_week", {}).get(week, {}) if week else {}
+    if qw.get("scored") and qw.get("usefulness") is not None:
+        agent_hours_score = norm_hours * qw["efficiency"] * qw["usefulness"]
+        qaah_confidence = "scored"
+    else:
+        agent_hours_score = norm_hours
+        qaah_confidence = "low_confidence_fallback"
 
     parallel_pct = parallel_data.get("parallel_sessions_pct", 0.0)
     parallel_score = _normalize_parallel(parallel_pct)
@@ -119,6 +132,10 @@ def _score_developer(
         "components": {k: round(v, 1) for k, v in components.items()},
         "weights": _WEIGHTS,
         "agent_hours_raw": round(hours, 2),
+        "qaah": qw.get("qaah"),
+        "qaah_confidence": qaah_confidence,
+        "efficiency": qw.get("efficiency"),
+        "usefulness": qw.get("usefulness"),
         "week": week,
     }
 
@@ -130,7 +147,7 @@ class Composite(MetricComputer):
     name = "composite"
     phase = "score"
     deps = ("adoption", "agent_hours", "parallel_agents", "depth", "harness",
-            "trust", "outcomes", "velocity", "consistency")
+            "trust", "outcomes", "velocity", "consistency", "qaah")
 
     def compute(self, ctx: ComputeContext) -> list:
         week = ctx.week
@@ -148,6 +165,7 @@ class Composite(MetricComputer):
                 outcomes_data    = ctx.get("outcomes").get(key, {}),
                 velocity_data    = ctx.get("velocity").get(key, {}),
                 consistency_data = ctx.get("consistency").get(key, {}),
+                qaah_data        = ctx.get("qaah").get(key, {}),
                 week             = week,
             )
             score["name"] = ctx.dev_name_map.get(key) or "unknown"

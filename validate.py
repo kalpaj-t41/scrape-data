@@ -60,9 +60,9 @@ def validate_registry() -> None:
 
     expected = {"adoption", "agent_hours", "parallel_agents", "depth", "harness",
                 "skills", "trust", "outcomes", "velocity", "consistency",
-                "efficiency", "usefulness", "agent_quality",
+                "efficiency", "usefulness", "agent_quality", "qaah",
                 "composite", "equity"}
-    check("Registry holds all 15 computers", len(_registry.names()), 15)
+    check("Registry holds all 16 computers", len(_registry.names()), 16)
     check("Registry names match expected set",
           sorted(_registry.names()), sorted(expected))
 

@@ -22,6 +22,7 @@ from computers import (  # noqa: F401
     efficiency,
     usefulness,
     agent_quality,
+    qaah,
     composite,
     equity,
 )

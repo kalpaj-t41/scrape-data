@@ -222,6 +222,7 @@ def _score_week(week: str, ctx: ComputeContext, store: MetricsStore) -> dict:
     skills_c      = registry.get("skills")
     efficiency_c  = registry.get("efficiency")
     usefulness_c  = registry.get("usefulness")
+    qaah_c        = registry.get("qaah")
 
     team_score = composite_c.team_composite(developer_scores, equity_data=equity_data)
 
@@ -245,6 +246,7 @@ def _score_week(week: str, ctx: ComputeContext, store: MetricsStore) -> dict:
             "agent_hours": agent_hours_c.team_summary(ctx.get("agent_hours"), ctx),
             "velocity":    velocity_c.team_summary(ctx.get("velocity"), ctx),
             "skills":      skills_c.team_summary(ctx.get("skills"), ctx),
+            "qaah":        qaah_c.team_summary(ctx.get("qaah"), ctx),
             "efficiency":  efficiency_c.team_summary(eff_results, ctx),
             "usefulness":  usefulness_c.team_summary(use_results, ctx),
             "agent_quality": ctx.get("agent_quality"),
@@ -349,13 +351,14 @@ def print_report(payload: dict) -> None:
     logger.info("=" * 62)
     logger.info(f"  AI Native Score     {team.get('team_ai_native_score'):>6}  {team.get('label','')}")
     logger.info(f"  Team Adoption       {team.get('adoption',{}).get('adoption_index',0):>5}%  ({team.get('adoption',{}).get('active_developers','?')}/{team.get('adoption',{}).get('total_developers','?')} devs active)")
-    logger.info(f"  Avg Agent Hours/Dev {team.get('agent_hours',{}).get('avg_agent_hours',0):>6.1f}  (target: 80 hrs/week)")
+    logger.info(f"  Avg Agent Hours/Dev {team.get('agent_hours',{}).get('avg_agent_hours',0):>6.1f}  (raw quantity; target 80 hrs/week)")
+    logger.info(f"  Avg QAAH/Dev        {(team.get('qaah',{}) or {}).get('avg_qaah',0):>6.1f}  (quality-adjusted hours = hrs × eff × use — the scored quantity)")
     logger.info(f"  Team Velocity       {team.get('velocity',{}).get('team_velocity',0):>6.0f}  lines / agent hour")
     logger.info(f"  Skill Invocations   {team.get('skills',{}).get('total_invocations',0):>6}")
     _eff = team.get("efficiency", {}) or {}
     _use = team.get("usefulness", {}) or {}
     logger.info(f"  Avg Efficiency      {(_eff.get('avg_efficiency') or 0):>6.2f}  (1.0 = no time lost to failed/retried calls)")
-    logger.info(f"  Avg Usefulness      {(_use.get('avg_usefulness') or 0):>6.2f}  (coverage {(_use.get('avg_coverage') or 0):.2f})  [quality layer — not yet in the score]")
+    logger.info(f"  Avg Usefulness      {(_use.get('avg_usefulness') or 0):>6.2f}  (coverage {(_use.get('avg_coverage') or 0):.2f})  [folded into the score via QAAH]")
     logger.info("")
     logger.info(f"  {'Developer':<18} {'Team (org/project)':<24} {'Score':>6} {'AgentHrs':>9} {'Eff':>5} {'Use':>5} {'Status':<13}")
     logger.info("  " + "-" * 92)
