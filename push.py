@@ -75,9 +75,13 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     # sessions already stored under the old telemetry-primary scheme.
     jsonl_sessions = session_index.collect(developer_map, since=since)
     union_metas = session_index.merge_jsonl_primary(jsonl_sessions, raw_session_metas)
-    new_metas = [m for m in union_metas if m["session_id"] not in already_sm]
+    # Always upsert all sessions within the --since window: web flags, agent_names, and
+    # other derived fields can change as sub-agents run after the first push.
+    # Sessions outside the window are not collected (file mtime filtered), so this is safe.
+    new_metas = union_metas if since else [m for m in union_metas if m["session_id"] not in already_sm]
+    truly_new = sum(1 for m in new_metas if m["session_id"] not in already_sm)
     logger.info(f"         {len(jsonl_sessions)} JSONL (primary), {len(raw_session_metas)} telemetry, "
-                f"{len(union_metas)} union, {len(new_metas)} new")
+                f"{len(union_metas)} union, {truly_new} new, {len(new_metas) - truly_new} refreshed")
 
     logger.info("[push] Parsing JSONL transcripts...")
     raw_turn_events = sessions.collect(
@@ -93,6 +97,11 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     seg_sessions = len({s["session_id"] for s in raw_busy_segments})
     logger.info(f"         {len(raw_busy_segments)} segments across {seg_sessions} sessions")
 
+    logger.info("[push] Extracting per-segment quality signals (efficiency/usefulness)...")
+    raw_segment_signals = sessions.collect_segment_signals(developer_map, since=since)
+    sig_sessions = len({s["session_id"] for s in raw_segment_signals})
+    logger.info(f"         {len(raw_segment_signals)} signal segments across {sig_sessions} sessions")
+
     logger.info("[push] Collecting facets, app state, plans, agent tasks...")
     raw_facets      = facets.collect(developer_map)
     raw_app_state   = app_state.collect(developer_map)
@@ -106,13 +115,14 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
                 f"{len(raw_agent_tasks)} agent sessions ({task_count} tasks)")
 
     raw = {
-        "session_metas": new_metas,
-        "turn_events":   raw_turn_events,
-        "busy_segments": raw_busy_segments,
-        "facets":        raw_facets,
-        "app_state":     raw_app_state,
-        "plans":         raw_plans,
-        "agent_tasks":   raw_agent_tasks,
+        "session_metas":   new_metas,
+        "turn_events":     raw_turn_events,
+        "busy_segments":   raw_busy_segments,
+        "segment_signals": raw_segment_signals,
+        "facets":          raw_facets,
+        "app_state":       raw_app_state,
+        "plans":           raw_plans,
+        "agent_tasks":     raw_agent_tasks,
     }
 
     # ── Summary ───────────────────────────────────────────────────────────────
@@ -120,6 +130,7 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     logger.info(f"         session_metas  : {len(new_metas)}")
     logger.info(f"         turn_events    : {len(raw_turn_events)}")
     logger.info(f"         busy_segments  : {len(raw_busy_segments)}")
+    logger.info(f"         segment_signals: {len(raw_segment_signals)}")
     logger.info(f"         facets         : {len(raw_facets)}")
     logger.info(f"         app_state      : {len(raw_app_state)}")
     logger.info(f"         plans          : {len(raw_plans)}")
@@ -132,25 +143,18 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
 
     # ── Push ─────────────────────────────────────────────────────────────────
     inserted = store.push(raw, force=force)
+    stats_after = store.stats()
     store.close()
 
-    stats_delta = {
-        "session_metas": inserted.get("session_metas", 0),
-        "turn_events":   inserted.get("turn_events", 0),
-        "busy_segments": inserted.get("busy_segments", 0),
-        "facets":        inserted.get("facets", 0),
-        "app_state":     inserted.get("app_state", 0),
-        "plans":         inserted.get("plans", 0),
-        "agent_tasks":   inserted.get("agent_tasks", 0),
-    }
-
     logger.info("\n[push] Done.")
-    logger.info(f"  {'Table':<22} {'Before':>8} {'Inserted':>10} {'After':>8}")
+    logger.info(f"  {'Table':<22} {'Before':>8} {'Upserted':>10} {'After':>8}")
     logger.info("  " + "-" * 52)
-    for k, before in stats_before.items():
-        if k in stats_delta:
-            after = before + stats_delta[k]
-            logger.info(f"  {k:<22} {before:>8} {stats_delta[k]:>10} {after:>8}")
+    tables = ["session_metas", "turn_events", "busy_segments", "segment_signals", "facets", "app_state", "plans", "agent_tasks"]
+    for k in tables:
+        before = stats_before.get(k, 0)
+        upserted = inserted.get(k, 0)
+        after = stats_after.get(k, before)
+        logger.info(f"  {k:<22} {before:>8} {upserted:>10} {after:>8}")
 
 
 def main():

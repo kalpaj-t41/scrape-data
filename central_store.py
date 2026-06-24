@@ -189,7 +189,19 @@ CREATE TABLE IF NOT EXISTS busy_segments (
 );
 CREATE INDEX IF NOT EXISTS idx_bs_sid ON busy_segments(session_id);
 CREATE INDEX IF NOT EXISTS idx_bs_dev ON busy_segments(developer_key);
-CREATE INDEX IF NOT EXISTS idx_bs_week ON busy_segments(week)
+CREATE INDEX IF NOT EXISTS idx_bs_week ON busy_segments(week);
+CREATE TABLE IF NOT EXISTS segment_signals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL,
+    developer_key TEXT NOT NULL,
+    start_ts      TEXT,
+    week          TEXT,
+    pushed_at     TEXT NOT NULL,
+    data          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ss_sid  ON segment_signals(session_id);
+CREATE INDEX IF NOT EXISTS idx_ss_dev  ON segment_signals(developer_key);
+CREATE INDEX IF NOT EXISTS idx_ss_week ON segment_signals(week)
 """
 
 
@@ -341,7 +353,21 @@ CREATE TABLE IF NOT EXISTS scrape_data.busy_segments (
 
 CREATE INDEX IF NOT EXISTS idx_bs_sid  ON scrape_data.busy_segments(session_id);
 CREATE INDEX IF NOT EXISTS idx_bs_dev  ON scrape_data.busy_segments(developer_key);
-CREATE INDEX IF NOT EXISTS idx_bs_week ON scrape_data.busy_segments(week)
+CREATE INDEX IF NOT EXISTS idx_bs_week ON scrape_data.busy_segments(week);
+
+CREATE TABLE IF NOT EXISTS scrape_data.segment_signals (
+    id            BIGSERIAL PRIMARY KEY,
+    session_id    TEXT NOT NULL,
+    developer_key TEXT NOT NULL,
+    start_ts      TIMESTAMPTZ,
+    week          TEXT,
+    data          JSONB NOT NULL,
+    pushed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ss_sid  ON scrape_data.segment_signals(session_id);
+CREATE INDEX IF NOT EXISTS idx_ss_dev  ON scrape_data.segment_signals(developer_key);
+CREATE INDEX IF NOT EXISTS idx_ss_week ON scrape_data.segment_signals(week)
 """
 
 _SM_COLS = [
@@ -375,7 +401,7 @@ class _BaseStore:
         inserted = {
             "session_metas": 0, "turn_events": 0, "facets": 0,
             "app_state": 0, "plans": 0, "agent_tasks": 0,
-            "background_tasks": 0, "busy_segments": 0,
+            "background_tasks": 0, "busy_segments": 0, "segment_signals": 0,
         }
 
         for meta in raw.get("session_metas", []):
@@ -420,15 +446,9 @@ class _BaseStore:
                 "user_response_times":     _dumps(meta.get("user_response_times") or []),
                 "agent_names":             _dumps(meta.get("agent_names") or []),
             }
-            if force:
-                n = self._upsert_replace("session_metas", sm_row, conflict_col="session_id")
-            else:
-                cols = ", ".join(sm_row.keys())
-                ph   = ", ".join(["{p}"] * len(sm_row))
-                n = self._upsert_ignore(
-                    f"INSERT INTO session_metas ({cols}) VALUES ({ph})",
-                    tuple(sm_row.values()),
-                )
+            # Always upsert — push.py sends refreshed sessions (web flags, agent_names
+            # can change after the first push as sub-agents run in active sessions).
+            n = self._upsert_replace("session_metas", sm_row, conflict_col="session_id")
             inserted["session_metas"] += n
 
         # turn_events — one row per turn; always replace all turns for sessions in this push
@@ -528,6 +548,24 @@ class _BaseStore:
                  1 if s.get("is_sidechain") else 0, _week_of(s.get("start_ts"))),
             )
             inserted["busy_segments"] += 1
+
+        # segment_signals — session-level replace (quality-layer backbone: per-segment
+        # tool-call / verification / churn signals; nested lists stored as JSON blob).
+        sig_sids = {s.get("session_id") for s in raw.get("segment_signals", []) if s.get("session_id")}
+        for sid in sig_sids:
+            self._execute("DELETE FROM segment_signals WHERE session_id = {p}", (sid,))
+        for s in raw.get("segment_signals", []):
+            sid = s.get("session_id")
+            if not sid:
+                continue
+            self._execute(
+                "INSERT INTO segment_signals "
+                "(session_id, developer_key, start_ts, week, pushed_at, data) "
+                "VALUES ({p},{p},{p},{p},{p},{p})",
+                (sid, s.get("developer_key", ""), s.get("start_ts"),
+                 _week_of(s.get("start_ts")), now, _dumps(s)),
+            )
+            inserted["segment_signals"] += 1
 
         self._commit()
         return inserted
@@ -654,9 +692,14 @@ class _BaseStore:
                     "background_tasks": [],
                 }
 
+        # agent_tasks and background_tasks: not gated by in_scope (JSONL-only sessions
+        # still count for harness M7), but DO respect the since window.
+        _at_filter  = ("WHERE enqueued_at >= {p} OR enqueued_at IS NULL", (since_date,)) \
+                      if since_date else ("", ())
         for r in self._fetchall(
             "SELECT session_id, developer_key, task_id, agent_name, task_description, "
-            "status, enqueued_at, week FROM agent_tasks"
+            f"status, enqueued_at, week FROM agent_tasks {_at_filter[0]}",
+            _at_filter[1],
         ):
             sid = r[0]
             if sid not in agent_tasks:
@@ -676,7 +719,12 @@ class _BaseStore:
             if r[3] and r[3] not in agent_tasks[sid]["agent_names"]:
                 agent_tasks[sid]["agent_names"].append(r[3])
 
-        for r in self._fetchall("SELECT session_id, enqueued_at, week FROM background_tasks"):
+        _bt_filter = ("WHERE enqueued_at >= {p} OR enqueued_at IS NULL", (since_date,)) \
+                     if since_date else ("", ())
+        for r in self._fetchall(
+            f"SELECT session_id, enqueued_at, week FROM background_tasks {_bt_filter[0]}",
+            _bt_filter[1],
+        ):
             sid = r[0]
             if sid not in agent_tasks:
                 agent_tasks[sid] = {
@@ -685,11 +733,18 @@ class _BaseStore:
                 }
             agent_tasks[sid]["background_tasks"].append({"enqueued_at": r[1], "week": r[2]})
 
-        # All segments (not gated by in_scope): JSONL-only sessions still count.
+        # busy_segments: not gated by in_scope (JSONL-only sessions still count for
+        # agent_hours), but DO respect the since window so --since 1d vs 7d differ.
         busy_segments: list[dict] = []
-        for r in self._fetchall(
-            "SELECT session_id, developer_key, start_ts, end_ts, is_sidechain FROM busy_segments"
-        ):
+        _seg_sql = (
+            "SELECT session_id, developer_key, start_ts, end_ts, is_sidechain "
+            "FROM busy_segments WHERE start_ts >= {p}"
+            if since_date else
+            "SELECT session_id, developer_key, start_ts, end_ts, is_sidechain "
+            "FROM busy_segments"
+        )
+        _seg_args = (since_date,) if since_date else ()
+        for r in self._fetchall(_seg_sql, _seg_args):
             busy_segments.append({
                 "session_id":    r[0],
                 "developer_key": r[1],
@@ -697,6 +752,19 @@ class _BaseStore:
                 "end_ts":        r[3],
                 "is_sidechain":  bool(r[4]),
             })
+
+        # segment_signals: quality-layer backbone; respect the since window like
+        # busy_segments. The full per-segment record is stored as a JSON blob.
+        segment_signals: list[dict] = []
+        _sig_sql = (
+            "SELECT data FROM segment_signals WHERE start_ts >= {p}"
+            if since_date else
+            "SELECT data FROM segment_signals"
+        )
+        _sig_args = (since_date,) if since_date else ()
+        for r in self._fetchall(_sig_sql, _sig_args):
+            if r[0]:
+                segment_signals.append(json.loads(r[0]))
 
         return {
             "session_metas": session_metas,
@@ -706,6 +774,7 @@ class _BaseStore:
             "plans":         plans,
             "agent_tasks":   agent_tasks,
             "busy_segments": busy_segments,
+            "segment_signals": segment_signals,
         }
 
     def stats(self) -> dict:
@@ -718,6 +787,7 @@ class _BaseStore:
             "agent_tasks":      self._fetchall("SELECT COUNT(*) FROM agent_tasks")[0][0],
             "background_tasks": self._fetchall("SELECT COUNT(*) FROM background_tasks")[0][0],
             "busy_segments":    self._fetchall("SELECT COUNT(*) FROM busy_segments")[0][0],
+            "segment_signals":  self._fetchall("SELECT COUNT(*) FROM segment_signals")[0][0],
             "developers":       self._fetchall(
                 "SELECT COUNT(DISTINCT developer_key) FROM session_metas"
             )[0][0],
@@ -988,7 +1058,7 @@ class _PostgresStore:
         from psycopg2.extras import Json, execute_values
 
         now = datetime.now(tz=timezone.utc)
-        inserted = {"session_metas": 0, "turn_events": 0, "facets": 0, "app_state": 0, "plans": 0, "agent_tasks": 0, "background_tasks": 0, "busy_segments": 0}
+        inserted = {"session_metas": 0, "turn_events": 0, "facets": 0, "app_state": 0, "plans": 0, "agent_tasks": 0, "background_tasks": 0, "busy_segments": 0, "segment_signals": 0}
         cur = self._conn.cursor()
 
         # In force mode, delete existing rows for all incoming sessions before re-inserting
@@ -997,6 +1067,7 @@ class _PostgresStore:
                 {m.get("session_id") for m in raw.get("session_metas", []) if m.get("session_id")}
                 | {t.get("session_id") for t in raw.get("turn_events", []) if t.get("session_id")}
                 | {s.get("session_id") for s in raw.get("busy_segments", []) if s.get("session_id")}
+                | {s.get("session_id") for s in raw.get("segment_signals", []) if s.get("session_id")}
                 | set(raw.get("facets", {}).keys())
                 | set(raw.get("agent_tasks", {}).keys())
             )
@@ -1006,6 +1077,7 @@ class _PostgresStore:
                 cur.execute("DELETE FROM scrape_data.agent_tasks  WHERE session_id = ANY(%s)", (sid_list,))
                 cur.execute("DELETE FROM scrape_data.background_tasks WHERE session_id = ANY(%s)", (sid_list,))
                 cur.execute("DELETE FROM scrape_data.busy_segments WHERE session_id = ANY(%s)", (sid_list,))
+                cur.execute("DELETE FROM scrape_data.segment_signals WHERE session_id = ANY(%s)", (sid_list,))
                 cur.execute("DELETE FROM scrape_data.facets       WHERE session_id = ANY(%s)", (sid_list,))
                 cur.execute("DELETE FROM scrape_data.session_metas WHERE session_id = ANY(%s)", (sid_list,))
 
@@ -1343,6 +1415,40 @@ class _PostgresStore:
             )
             inserted["busy_segments"] = len(seg_rows)
 
+        # ── segment_signals — session-level replace (quality-layer backbone) ──
+        sig_rows = []
+        sig_sids = set()
+        for s in raw.get("segment_signals", []):
+            sid = s.get("session_id")
+            if not sid:
+                continue
+            sig_sids.add(sid)
+            sig_rows.append((
+                sid,
+                s.get("developer_key", ""),
+                s.get("start_ts"),
+                _week_of(s.get("start_ts")),
+                Json(s),
+                now,
+            ))
+        if sig_sids and not force:
+            # force mode already deleted these above; otherwise refresh per session
+            cur.execute(
+                "DELETE FROM scrape_data.segment_signals WHERE session_id = ANY(%s)",
+                (list(sig_sids),),
+            )
+        if sig_rows:
+            execute_values(
+                cur,
+                """
+                INSERT INTO scrape_data.segment_signals (
+                    session_id, developer_key, start_ts, week, data, pushed_at
+                ) VALUES %s
+                """,
+                sig_rows,
+            )
+            inserted["segment_signals"] = len(sig_rows)
+
         self._conn.commit()
         return inserted
 
@@ -1545,6 +1651,18 @@ class _PostgresStore:
                 "is_sidechain":  bool(row[4]),
             })
 
+        # segment_signals — quality-layer backbone (JSONB blob = full per-segment record).
+        segment_signals: list[dict] = []
+        sig_sql = "SELECT data FROM scrape_data.segment_signals"
+        if since_date:
+            sig_rows = self._fetchall(sig_sql + " WHERE start_ts >= %s OR start_ts IS NULL", (since,))
+        else:
+            sig_rows = self._fetchall(sig_sql)
+        for row in sig_rows:
+            if row[0]:
+                # JSONB comes back as dict (psycopg2) or str depending on adapter.
+                segment_signals.append(row[0] if isinstance(row[0], dict) else json.loads(row[0]))
+
         return {
             "session_metas": session_metas,
             "turn_events":   turn_events,
@@ -1553,6 +1671,7 @@ class _PostgresStore:
             "plans":         plans,
             "agent_tasks":   agent_tasks_result,
             "busy_segments": busy_segments,
+            "segment_signals": segment_signals,
         }
 
     # ── stats ─────────────────────────────────────────────────────────────────
@@ -1567,6 +1686,7 @@ class _PostgresStore:
             "agent_tasks":   self._fetchall("SELECT COUNT(*) FROM scrape_data.agent_tasks")[0][0],
             "background_tasks": self._fetchall("SELECT COUNT(*) FROM scrape_data.background_tasks")[0][0],
             "busy_segments": self._fetchall("SELECT COUNT(*) FROM scrape_data.busy_segments")[0][0],
+            "segment_signals": self._fetchall("SELECT COUNT(*) FROM scrape_data.segment_signals")[0][0],
             "developers":    self._fetchall(
                 "SELECT COUNT(DISTINCT developer_key) FROM scrape_data.session_metas"
             )[0][0],

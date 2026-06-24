@@ -339,6 +339,15 @@ def run_all_weeks(
     return week_payloads
 
 
+def _q(v, width: int = 6, prec: int = 2) -> str:
+    """Format a quality value right-aligned to `width`. None (no signal in the store /
+    metric not scored) prints as an em-dash, never a fake 0.00 — absent signal must not
+    masquerade as a confident score (a real 0.0 still prints as 0.00)."""
+    if v is None:
+        return f"{'—':>{width}}"
+    return f"{v:>{width}.{prec}f}"
+
+
 def print_report(payload: dict) -> None:
     team = payload.get("team", {})
     devs = payload.get("developers", [])
@@ -357,8 +366,8 @@ def print_report(payload: dict) -> None:
     logger.info(f"  Skill Invocations   {team.get('skills',{}).get('total_invocations',0):>6}")
     _eff = team.get("efficiency", {}) or {}
     _use = team.get("usefulness", {}) or {}
-    logger.info(f"  Avg Efficiency      {(_eff.get('avg_efficiency') or 0):>6.2f}  (1.0 = no time lost to failed/retried calls)")
-    logger.info(f"  Avg Usefulness      {(_use.get('avg_usefulness') or 0):>6.2f}  (coverage {(_use.get('avg_coverage') or 0):.2f})  [folded into the score via QAAH]")
+    logger.info(f"  Avg Efficiency      {_q(_eff.get('avg_efficiency'))}  (1.0 = no time lost to failed/retried calls)")
+    logger.info(f"  Avg Usefulness      {_q(_use.get('avg_usefulness'))}  (coverage {_q(_use.get('avg_coverage'), 4, 2)})  [folded into the score via QAAH]")
     logger.info("")
     logger.info(f"  {'Developer':<18} {'Team (org/project)':<24} {'Score':>6} {'AgentHrs':>9} {'Eff':>5} {'Use':>5} {'Status':<13}")
     logger.info("  " + "-" * 92)
@@ -366,11 +375,10 @@ def print_report(payload: dict) -> None:
         flag = " ← needs attention" if d.get("agent_hours_status") == "stuck" else ""
         name = (str(d.get("name") or "unknown"))[:17]
         dteam = (str(d.get("team") or "unknown"))[:23]
-        eff_v = d.get("efficiency"); use_v = d.get("usefulness")
         logger.info(
             f"  {name:<18} {dteam:<24} "
             f"{d['ai_native_score']:>6.1f} {d.get('agent_hours_week',0):>8.1f}h "
-            f"{(eff_v if eff_v is not None else 0):>5.2f} {(use_v if use_v is not None else 0):>5.2f} "
+            f"{_q(d.get('efficiency'), 5, 2)} {_q(d.get('usefulness'), 5, 2)} "
             f"{d.get('agent_hours_status',''):<13}{flag}"
         )
 
@@ -382,7 +390,7 @@ def print_report(payload: dict) -> None:
         for t, v in sorted(by_type.items(), key=lambda x: -(x[1].get("n_agents") or 0)):
             logger.info(
                 f"    {str(t)[:19]:<20} {v.get('n_agents',0):>3} "
-                f"{(v.get('avg_efficiency') or 0):>6.2f} {(v.get('avg_usefulness') or 0):>6.2f} "
+                f"{_q(v.get('avg_efficiency'))} {_q(v.get('avg_usefulness'))} "
                 f"{(v.get('total_busy_hours') or 0):>8.2f}"
             )
     logger.info("=" * 62)
