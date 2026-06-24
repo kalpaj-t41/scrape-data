@@ -1,14 +1,18 @@
 """
 M13 — Consistency Score (0–100).
 
-Measures how evenly AI usage is spread across working days.
-A developer who logs 8 hrs on Monday and nothing else scores the same
-agent-hours total as one doing 1.6 hrs/day — but the latter pattern
-is far healthier. Coefficient of variation (std_dev / mean) captures
-this: low CV = consistent daily habit.
+Measures how evenly AI usage is spread across working days. A developer who logs
+8 hrs on Monday and nothing else scores the same agent-hours total as one doing
+1.6 hrs/day — but the latter pattern is far healthier. Coefficient of variation
+(std_dev / mean) of daily hours captures this: low CV = consistent daily habit.
 
-Score of 100 = perfectly uniform daily use.
-Score of 0   = all usage bunched into one day.
+Source of truth (U7/KTD7): daily hours are the **union of busy segments per day**
+(ctx.busy_segments — the same JSONL source agent_hours uses), NOT session-meta
+`duration − idle` telemetry. Each segment is attributed to the UTC day of its start
+and counted once (a segment spanning midnight is not double-counted); within a day,
+overlapping segments are unioned so parallel sub-agents don't inflate the total.
+
+Score of 100 = perfectly uniform daily use.  Score of 0 = all usage in one day.
 """
 
 import math
@@ -19,14 +23,28 @@ from computers.base import ComputeContext, MetricComputer
 from computers.registry import registry
 
 
-def _date_from_ts(ts: str) -> str | None:
-    if not ts:
-        return None
+def _parse(ts: str) -> datetime | None:
     try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return dt.date().isoformat()
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def _union_hours(intervals: list[tuple[datetime, datetime]]) -> float:
+    """Hours covered by the merged (overlap-collapsed) intervals."""
+    total_ms = 0.0
+    cur_s = cur_e = None
+    for s, e in sorted(intervals):
+        if cur_s is None:
+            cur_s, cur_e = s, e
+        elif s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            total_ms += (cur_e - cur_s).total_seconds() * 1000
+            cur_s, cur_e = s, e
+    if cur_s is not None:
+        total_ms += (cur_e - cur_s).total_seconds() * 1000
+    return total_ms / 3_600_000
 
 
 @registry.register
@@ -34,19 +52,19 @@ class Consistency(MetricComputer):
     name = "consistency"
 
     def compute(self, ctx: ComputeContext) -> dict:
+        # dev -> UTC-day -> list of (start, end) busy intervals
+        seg_by_dev_day: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+        for seg in ctx.busy_segments:
+            dev = seg.get("developer_key")
+            s, e = _parse(seg.get("start_ts")), _parse(seg.get("end_ts"))
+            if not dev or not s or not e or e <= s:
+                continue
+            seg_by_dev_day[dev][s.date().isoformat()].append((s, e))
+
         results: dict[str, dict] = {}
-
-        for key, sessions in ctx.sessions_by_dev.items():
-            day_hours: dict[str, float] = defaultdict(float)
-            for meta in sessions:
-                date_str = _date_from_ts(meta.get("start_time") or "")
-                if not date_str:
-                    continue
-                duration_s = (meta.get("duration_minutes") or 0) * 60
-                user_idle_s = sum(meta.get("user_response_times") or [])
-                day_hours[date_str] += max(0.0, duration_s - user_idle_s) / 3600
-
-            values = list(day_hours.values())
+        for dev, days in seg_by_dev_day.items():
+            day_hours = {d: _union_hours(ivs) for d, ivs in days.items()}
+            values = [h for h in day_hours.values() if h > 0]
             n = len(values)
             if n == 0:
                 continue
@@ -63,8 +81,8 @@ class Consistency(MetricComputer):
                 "Bursty"
             )
 
-            results[key] = {
-                "developer_key":       key,
+            results[dev] = {
+                "developer_key":       dev,
                 "consistency_score":   round(consistency * 100, 1),
                 "consistency_label":   label,
                 "mean_daily_hours":    round(mean_h, 2),
