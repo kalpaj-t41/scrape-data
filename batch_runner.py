@@ -220,8 +220,22 @@ def _score_week(week: str, ctx: ComputeContext, store: MetricsStore) -> dict:
     agent_hours_c = registry.get("agent_hours")
     velocity_c    = registry.get("velocity")
     skills_c      = registry.get("skills")
+    efficiency_c  = registry.get("efficiency")
+    usefulness_c  = registry.get("usefulness")
 
     team_score = composite_c.team_composite(developer_scores, equity_data=equity_data)
+
+    # Surface the quality layer (U4/U5/U12) for visibility. These do NOT feed the
+    # composite score yet — that fold-in is QAAH (U6). Here they ride alongside.
+    eff_results = ctx.get("efficiency")
+    use_results = ctx.get("usefulness")
+    for d in developer_scores:
+        k = d["developer_key"]
+        ew = eff_results.get(k, {}).get("by_week", {}).get(week, {})
+        uw = use_results.get(k, {}).get("by_week", {}).get(week, {})
+        d["efficiency"]          = ew.get("efficiency")
+        d["usefulness"]          = uw.get("usefulness_base")
+        d["usefulness_coverage"] = uw.get("coverage_band")
 
     return {
         "week": week,
@@ -231,6 +245,9 @@ def _score_week(week: str, ctx: ComputeContext, store: MetricsStore) -> dict:
             "agent_hours": agent_hours_c.team_summary(ctx.get("agent_hours"), ctx),
             "velocity":    velocity_c.team_summary(ctx.get("velocity"), ctx),
             "skills":      skills_c.team_summary(ctx.get("skills"), ctx),
+            "efficiency":  efficiency_c.team_summary(eff_results, ctx),
+            "usefulness":  usefulness_c.team_summary(use_results, ctx),
+            "agent_quality": ctx.get("agent_quality"),
         },
         "developers": sorted(developer_scores, key=lambda d: d["ai_native_score"], reverse=True),
     }
@@ -324,6 +341,7 @@ def print_report(payload: dict) -> None:
     team = payload.get("team", {})
     devs = payload.get("developers", [])
     week = payload.get("week", "")
+    aq = team.get("agent_quality", {}) or {}
 
     logger.info("")
     logger.info("=" * 62)
@@ -334,18 +352,36 @@ def print_report(payload: dict) -> None:
     logger.info(f"  Avg Agent Hours/Dev {team.get('agent_hours',{}).get('avg_agent_hours',0):>6.1f}  (target: 80 hrs/week)")
     logger.info(f"  Team Velocity       {team.get('velocity',{}).get('team_velocity',0):>6.0f}  lines / agent hour")
     logger.info(f"  Skill Invocations   {team.get('skills',{}).get('total_invocations',0):>6}")
+    _eff = team.get("efficiency", {}) or {}
+    _use = team.get("usefulness", {}) or {}
+    logger.info(f"  Avg Efficiency      {(_eff.get('avg_efficiency') or 0):>6.2f}  (1.0 = no time lost to failed/retried calls)")
+    logger.info(f"  Avg Usefulness      {(_use.get('avg_usefulness') or 0):>6.2f}  (coverage {(_use.get('avg_coverage') or 0):.2f})  [quality layer — not yet in the score]")
     logger.info("")
-    logger.info(f"  {'Developer':<18} {'Team (org/project)':<34} {'Score':>6} {'AgentHrs':>9} {'Status':<13}")
-    logger.info("  " + "-" * 86)
+    logger.info(f"  {'Developer':<18} {'Team (org/project)':<24} {'Score':>6} {'AgentHrs':>9} {'Eff':>5} {'Use':>5} {'Status':<13}")
+    logger.info("  " + "-" * 92)
     for d in devs:
         flag = " ← needs attention" if d.get("agent_hours_status") == "stuck" else ""
         name = (str(d.get("name") or "unknown"))[:17]
-        team = (str(d.get("team") or "unknown"))[:33]
+        dteam = (str(d.get("team") or "unknown"))[:23]
+        eff_v = d.get("efficiency"); use_v = d.get("usefulness")
         logger.info(
-            f"  {name:<18} {team:<34} "
-            f"{d['ai_native_score']:>6.1f} {d.get('agent_hours_week',0):>8.1f}h  "
+            f"  {name:<18} {dteam:<24} "
+            f"{d['ai_native_score']:>6.1f} {d.get('agent_hours_week',0):>8.1f}h "
+            f"{(eff_v if eff_v is not None else 0):>5.2f} {(use_v if use_v is not None else 0):>5.2f} "
             f"{d.get('agent_hours_status',''):<13}{flag}"
         )
+
+    by_type = aq.get("by_agent_type", {})
+    if by_type:
+        logger.info("")
+        logger.info(f"  Agent quality by type  ({len(aq.get('agents',{}))} agents, {len(aq.get('by_workflow_run',{}))} workflow runs)")
+        logger.info(f"    {'Type':<20} {'n':>3} {'Eff':>6} {'Use':>6} {'BusyHrs':>8}")
+        for t, v in sorted(by_type.items(), key=lambda x: -(x[1].get("n_agents") or 0)):
+            logger.info(
+                f"    {str(t)[:19]:<20} {v.get('n_agents',0):>3} "
+                f"{(v.get('avg_efficiency') or 0):>6.2f} {(v.get('avg_usefulness') or 0):>6.2f} "
+                f"{(v.get('total_busy_hours') or 0):>8.2f}"
+            )
     logger.info("=" * 62)
     logger.info("")
 
