@@ -79,6 +79,21 @@ def test_main_and_subagent_distinguished():
     assert agents["agent-A"]["agent_kind"] == "subagent"
 
 
+def test_efficiency_signal_flags_trivial_clean_agent():
+    """A clean agent with too few calls is flagged efficiency_signal='low' so its
+    1.0 is not mistaken for genuine efficiency; a busy clean agent is 'ok'."""
+    # trivial: 2 calls, no failures -> 1.0 but low signal
+    trivial = _seg("agent-T", "2026-06-24T10:00:00Z", "2026-06-24T10:01:00Z",
+                   [_call("2026-06-24T10:00:10Z"), _call("2026-06-24T10:00:20Z")])
+    # busy: 6 calls, no failures -> 1.0 and 'ok'
+    busy = _seg("agent-B", "2026-06-24T10:00:00Z", "2026-06-24T10:05:00Z",
+                [_call(f"2026-06-24T10:0{i}:10Z") for i in range(6)])
+    ag = AgentQuality().compute(_ctx([trivial, busy]))["agents"]
+    assert ag["agent-T"]["efficiency"] == 1.0 and ag["agent-T"]["efficiency_signal"] == "low", ag["agent-T"]
+    assert ag["agent-B"]["efficiency"] == 1.0 and ag["agent-B"]["efficiency_signal"] == "ok", ag["agent-B"]
+    assert ag["agent-T"]["n_calls"] == 2 and ag["agent-B"]["n_calls"] == 6
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures = 0

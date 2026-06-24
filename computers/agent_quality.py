@@ -16,6 +16,12 @@ from computers.registry import registry
 from computers.efficiency import _analyze_segment, _parse, _week
 from computers.usefulness import _is_useful, _has_strong_signal, _band, _segment_ms
 
+# Tunable: below this many tool calls an agent's efficiency is "nothing failed in a
+# tiny run", not "impressively efficient". Surfaced via efficiency_signal so a reader
+# can tell a trivial 1.0 from a genuine one. (62% of agents on live data are at 1.0;
+# this separates the ~1/3 that are trivially clean from the ~2/3 that genuinely are.)
+_MIN_CALLS_FOR_SIGNAL = 5
+
 
 def _rollup(records, key: str) -> dict:
     """Average efficiency/usefulness across agents sharing a key (workflow run / type)."""
@@ -57,6 +63,8 @@ class AgentQuality(MetricComputer):
             run_lengths: list[int] = []
             useful = 0
             strong_ms = 0.0
+            n_calls = 0
+            n_failures = 0
             for s in sigs:
                 w, rl, _ = _analyze_segment(s)
                 wasted_ms += w
@@ -65,22 +73,32 @@ class AgentQuality(MetricComputer):
                     useful += 1
                 if _has_strong_signal(s):
                     strong_ms += _segment_ms(s)
+                for c in s.get("tool_calls", []):
+                    n_calls += 1
+                    if c.get("is_error") is True:
+                        n_failures += 1
             n = len(sigs)
             cov = (strong_ms / busy_ms) if busy_ms > 0 else 0.0
+            # Distinguish a trustworthy efficiency from a low-signal one: too few tool
+            # calls means 1.0 just reflects a tiny clean run, not real efficiency.
+            efficiency_signal = "low" if n_calls < _MIN_CALLS_FOR_SIGNAL else "ok"
             agents[aid] = {
-                "agent_id":        aid,
-                "agent_kind":      first.get("agent_kind"),
-                "agent_type":      first.get("agent_type"),
-                "workflow_run_id": first.get("workflow_run_id"),
-                "parent_session":  first.get("session_id"),
-                "developer_key":   first.get("developer_key"),
-                "week":            _week(_parse(first.get("start_ts"))),
-                "busy_hours":      round(busy_ms / 3_600_000, 3),
-                "n_segments":      n,
-                "efficiency":      round(max(0.0, 1.0 - wasted_ms / busy_ms), 3) if busy_ms > 0 else 1.0,
-                "thrash_index":    round(sum(run_lengths) / len(run_lengths), 2) if run_lengths else 0.0,
-                "usefulness":      round(useful / n, 3) if n else None,
-                "coverage_band":   {"pct": round(cov, 3), "label": _band(cov)},
+                "agent_id":          aid,
+                "agent_kind":        first.get("agent_kind"),
+                "agent_type":        first.get("agent_type"),
+                "workflow_run_id":   first.get("workflow_run_id"),
+                "parent_session":    first.get("session_id"),
+                "developer_key":     first.get("developer_key"),
+                "week":              _week(_parse(first.get("start_ts"))),
+                "busy_hours":        round(busy_ms / 3_600_000, 3),
+                "n_segments":        n,
+                "n_calls":           n_calls,
+                "n_failures":        n_failures,
+                "efficiency":        round(max(0.0, 1.0 - wasted_ms / busy_ms), 3) if busy_ms > 0 else 1.0,
+                "efficiency_signal": efficiency_signal,
+                "thrash_index":      round(sum(run_lengths) / len(run_lengths), 2) if run_lengths else 0.0,
+                "usefulness":        round(useful / n, 3) if n else None,
+                "coverage_band":     {"pct": round(cov, 3), "label": _band(cov)},
             }
 
         return {
