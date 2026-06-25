@@ -9,10 +9,16 @@
 > exists but JSONL gone) + fields JSONL can't derive (`user_interruptions`). This is a deliberate
 > one-time cutover vs the old telemetry numbers (R2 accepted, not avoided).
 >
+> **Standalone plan** (not a child of the harness redesign — it changes the session *source*, which is
+> orthogonal to the harness split).
+>
 > Verified on sample data: 38 JSONL-primary + 4 telemetry orphans = 42; all 14 overlapping sessions
 > now JSONL-sourced; 6 enriched with telemetry interruptions; subagents excluded (38 real, not 106);
-> central.db force-repushed to JSONL-primary. Remaining: Postgres parity; R5 sub-agent line undercount
-> documented. `merge_gap_fill` kept (deprecated) for reference.
+> SQLite and remote PostgreSQL both force-repushed to JSONL-primary. ✅ **Postgres parity done**
+> (`session_metas.source` column + `background_tasks` table; force on PG already delete-then-reinserts
+> scoped to the pushed sessions). Remaining: `source` is written to PG but not surfaced on pull
+> (cosmetic, no metric impact); R5 sub-agent line undercount documented. `merge_gap_fill` kept
+> (deprecated) for reference.
 
 ## Context
 

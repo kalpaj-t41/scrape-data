@@ -1,5 +1,19 @@
 # Metrics Redesign — Two-Layer Harness (Readiness + Orchestration) + Config Collectors
 
+> **PARENT PLAN.** Tracks the larger redesign. Status of its parts:
+>
+> | Part | Status | Where |
+> |---|---|---|
+> | Compute-layer registry refactor (class-based, singleton) | ✅ DONE | `computers/base.py`, `computers/registry.py`, all 12 computers |
+> | M7 Orchestration Usage — fix the measurement (not just rename) | ✅ DONE (child) | `docs/orchestration-usage-accuracy-plan.md` |
+> | `agent_tasks` background_tasks capture + store persistence (SQLite + PG) | ✅ DONE | `collectors/agent_tasks.py`, `central_store.py` |
+> | M6 Environment Readiness (static config) + `config_assets.py` collector | ⏳ NOT STARTED | — |
+> | Composite weight rebalancing (readiness 0.07 + orchestration 0.05) | ⏳ NOT STARTED | — |
+> | New `docs/metrics.md` structure (M6 Readiness / M7 Orchestration) | ⏳ PARTIAL | `docs/metrics.md` (M6 updated; readiness pending) |
+>
+> Related (not a child of this plan): `docs/jsonl-session-index-plan.md` — JSONL became the
+> session source of truth (✅ DONE, JSONL-primary), which is independent of the harness split.
+
 ## Context
 
 The project answers **"how AI-native is this org?"** via a weighted composite score. Today

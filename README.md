@@ -12,15 +12,20 @@ Offline batch pipeline that reads raw `.claude*` directory files produced by Cla
 Per-machine (push.py)               Central server (batch_runner.py)
 ──────────────────────              ────────────────────────────────
 collectors/                         central_store.pull_raw()
-  sessions.py      ─┐                        │
-  session_meta.py   │                        ▼
-  facets.py         ├─▶ push.py ──▶  scrape_data.*  ──▶  computers/
-  agent_tasks.py    │   (PostgreSQL             │            │
-  app_state.py      │    or SQLite)             │            ▼
-  plans.py         ─┘                           └──▶  metrics.json
+  sessions.py       ─┐                       │
+  session_index.py   │ (JSONL = truth)       ▼
+  session_meta.py    ├─▶ push.py ──▶  scrape_data.*  ──▶  computers/ (registry)
+  agent_tasks.py     │   (PostgreSQL            │            │
+  facets.py          │    or SQLite)            │            ▼
+  app_state.py       │                          └──▶  metrics.json
+  plans.py          ─┘
 ```
 
 No Claude hooks or plugins required — reads files Claude Code already writes.
+
+**Session source of truth = JSONL.** `session_index.py` reconstructs session records from
+`projects/**/*.jsonl` (always present); `session_meta.py` telemetry only fills gaps. See
+`docs/jsonl-session-index-plan.md`.
 
 ---
 
@@ -113,13 +118,13 @@ python backfill_prompts.py $POSTGRES_URL
 
 ## Data sources (read-only)
 
-| Path | What it provides |
+| Path | Role |
 |---|---|
-| `~/.claude*/projects/**/*.jsonl` | Full conversation transcripts — turns, tool calls, agent events, skills |
-| `~/.claude*/usage-data/session-meta/*.json` | Per-session summaries — duration, token counts, lines changed |
+| `~/.claude*/projects/**/*.jsonl` | **Source of truth** — transcripts: turns, tool_use, structuredPatch (lines), usage (tokens), permissionMode, sidechain, queue-operation. `subagents/` files are not sessions. |
+| `~/.claude*/usage-data/session-meta/*.json` | Optional telemetry — enrichment / orphan fallback only (large coverage gaps) |
 | `~/.claude*/usage-data/facets/*.json` | AI-analysed outcomes — goal, achievement, friction |
 | `~/.claude*/.claude.json` | App state — startup count, background task flag |
-| `~/.claude*/plans/*.md` | Plan files — harness/planning-mode adoption |
+| `~/.claude*/plans/*.md` | Plan files — plan-mode fallback signal (`--daily` mode) |
 
 ---
 
@@ -127,12 +132,18 @@ python backfill_prompts.py $POSTGRES_URL
 
 | Table | Rows | Key columns |
 |---|---|---|
-| `session_metas` | one per session | `start_time`, `duration_minutes`, `tool_counts`, `ai_title`, `agent_names` |
-| `turn_events` | one per turn | `user_ts`, `agent_ms`, `is_sidechain`, `prompt_text`, `tool_uses` |
+| `session_metas` | one per session | `start_time`, `duration_minutes`, `tool_counts`, `ai_title`, `agent_names`, `source` |
+| `turn_events` | one per turn | `user_ts`, `agent_ms`, `is_sidechain`, `permission_mode`, `prompt_text`, `tool_uses` |
 | `facets` | one per session | `outcome`, `session_type`, `claude_helpfulness`, `goal_categories` |
 | `app_state` | one per developer | `total_startups`, `has_used_background_task` |
 | `plans` | one per developer | `total_plans`, `new_plans_since_last_run` |
 | `agent_tasks` | one per agent invocation | `agent_name`, `task_description`, `status`, `enqueued_at` |
+| `background_tasks` | one per agent-less enqueue | `session_id`, `enqueued_at`, `week` (harness M6 background) |
+| `busy_segments` | many per session | `start_ts`, `end_ts`, `is_sidechain` (agent hours) |
+
+SQLite mirrors these (agent_tasks / background_tasks stored as JSON blobs). `--force` push is a
+**scoped** refresh — deletes + reinserts only the session_ids in the current payload; other
+developers' rows are untouched.
 
 ---
 
@@ -141,14 +152,14 @@ python backfill_prompts.py $POSTGRES_URL
 | ID | Metric | Source |
 |---|---|---|
 | M1 | AI Adoption Index | active days, project breadth |
-| M2 | Agent Hours | `agent_ms` per turn, summed per week |
+| M2 | Agent Hours | busy segments from JSONL — wall-clock (union) vs labor (sum) vs parallelism |
 | M3 | Parallel Agents | `agent_colors_in_session`, `is_sidechain` |
 | M4 | Session Depth | tool call density, code volume, duration |
-| M5 | Harness Utilization | plan mode, task agents, Workflow tool |
+| M5 | Orchestration Usage (was Harness) | `permission_mode='plan'` · sub-agent delegation · background tasks (Workflow dropped) |
 | M6 | Skill Invocation | slash commands (`/deep-research`, `/code-review`, …) |
 | M7 | Trust Index | interruption rate, permission mode |
 | M8 | Goal Achievement | facet outcome ratings |
-| M9 | Code Velocity | lines per agent hour |
+| M9 | Code Velocity | lines per agent hour (per-week; generated-file rate cap) |
 | M10 | Consistency Score | coefficient of variation of daily agent hours |
 | — | Gini Coefficient | hours inequality across the team |
 | — | Trajectory Slope | team score trend over last 4 weeks |
@@ -158,11 +169,11 @@ python backfill_prompts.py $POSTGRES_URL
 
 | Score | Label |
 |---|---|
-| 80–100 | AI Native |
-| 60–79 | AI First |
-| 40–59 | AI Aware |
-| 20–39 | AI Assisted |
-| 0–19 | AI Curious |
+| 86–100 | AI Native |
+| 71–85 | AI Augmented |
+| 51–70 | AI Assisted |
+| 26–50 | AI Aware |
+| 0–25 | AI Absent |
 
 Agent hours target: **80 hrs/week per developer**. Below 20 hrs → `stuck`.
 
@@ -174,30 +185,26 @@ Agent hours target: **80 hrs/week per developer**. Below 20 hrs → `stuck`.
 scrape_data/
   collectors/          one file per data source (read-only, no side effects)
     discover.py        finds all ~/.claude* dirs and maps to developer keys
-    session_meta.py    reads usage-data/session-meta/*.json
-    sessions.py        parses JSONL transcripts → turn events + prompt text
-    agent_tasks.py     parses JSONL → agent names, task descriptions, ai-titles
+    sessions.py        parses JSONL → turn events + busy segments (agent hours)
+    session_index.py   JSONL → session_meta-shaped records (SOURCE OF TRUTH)
+    session_meta.py    usage-data/session-meta telemetry (enrichment / orphans)
+    agent_tasks.py     JSONL → agent tasks, background_tasks, ai-titles
     facets.py          reads usage-data/facets/*.json
     app_state.py       reads .claude.json
     plans.py           counts plans/*.md files
     plugins.py         reads installed_plugins.json
     settings.py        reads settings.json
-  computers/           pure functions — input dicts, output dicts, no I/O
-    adoption.py        M1
-    agent_hours.py     M2
-    parallel_agents.py M3
-    depth.py           M4
-    harness.py         M5
-    skills.py          M6
-    trust.py           M7
-    outcomes.py        M8
-    velocity.py        M9
-    consistency.py     M10
-    equity.py          Gini + trajectory slope
-    composite.py       weighted AI Native Score
-  batch_runner.py      orchestrates collect → index → compute → write
+  computers/           MetricComputer subclasses on a singleton registry
+    base.py            ComputeContext + MetricComputer ABC
+    registry.py        topo-orders deps; runs metric + score phases
+    adoption.py M2 · agent_hours.py M3 · parallel_agents.py M4 · depth.py M5
+    harness.py M6 (orchestration) · skills.py M7 · trust.py M8 · outcomes.py M9
+    velocity.py M10 · consistency.py M13 · equity.py M14/M15 · composite.py M1
+  batch_runner.py      orchestrates collect → index → compute → write (local or --from-store)
   central_store.py     SQLite / PostgreSQL dual backend
   metrics_store.py     local output JSON + history tracking
   push.py              per-machine collector → central store
+  validate.py          registry + output sanity checks
   backfill_prompts.py  one-time backfill of prompt_text for historical turns
+  docs/                metrics.md + 3 plan docs (see CLAUDE.md)
 ```

@@ -17,6 +17,7 @@ parent-only undercount for delegating sessions (see docs/jsonl-session-index-pla
 
 import json
 import re
+import subprocess
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,44 @@ from collectors.session_meta import _account_type
 _GIT_COMMIT_RE = re.compile(r"\bgit\s+(?:[a-z-]+\s+)*commit\b")
 _GIT_PUSH_RE = re.compile(r"\bgit\s+(?:[a-z-]+\s+)*push\b")
 _MCP_PREFIX = "mcp__"
+
+# Parse "org/repo" from a git remote URL (git@host:org/repo.git or https://host/org/repo.git).
+_REMOTE_RE = re.compile(r"[:/]([^/:]+)/([^/]+?)(?:\.git)?/?$")
+_git_cache: dict[str, tuple[str | None, str | None]] = {}
+
+
+def _git_org_project(cwd: str | None) -> tuple[str | None, str | None]:
+    """(org, project) from the git remote of `cwd`; fallback to the directory layout.
+
+    Run at collect time on the developer's machine (repos present). Cached per path.
+    """
+    if not cwd:
+        return None, None
+    if cwd in _git_cache:
+        return _git_cache[cwd]
+    org = project = None
+    try:
+        url = subprocess.run(
+            ["git", "-C", cwd, "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        m = _REMOTE_RE.search(url) if url else None
+        if m:
+            org, project = m.group(1), m.group(2)
+    except Exception:
+        pass
+    if not project:                      # fallback: leaf dir = project, parent = org-ish
+        p = Path(cwd)
+        project = p.name or None
+        org = org or (p.parent.name or None)
+    _git_cache[cwd] = (org, project)
+    return org, project
+
+
+def _team_label(org: str | None, project: str | None) -> str | None:
+    if org and project:
+        return f"{org}/{project}"
+    return org or project
 
 
 def _week_date(dt: datetime | None) -> tuple[str | None, str | None]:
@@ -155,12 +194,16 @@ class _Acc:
         duration_min = 0
         if self.first_dt and self.last_dt and self.last_dt > self.first_dt:
             duration_min = round((self.last_dt - self.first_dt).total_seconds() / 60, 1)
+        org, project = _git_org_project(self.cwd)
         return {
             "session_id": self.session_id,
             "developer_key": self.developer_key,
             "claude_dir": str(self.claude_dir),
             "account_type": _account_type(self.claude_dir),
             "project_path": self.cwd,
+            "git_org": org,
+            "git_project": project,
+            "team": _team_label(org, project),
             "start_time": self.first_dt.isoformat() if self.first_dt else "",
             "start_dt": self.first_dt,
             "week": week,
@@ -197,11 +240,16 @@ def _too_old(path: Path, since: datetime) -> bool:
         return False
 
 
+_WF_SKIP_STEMS = {"journal", "history"}
+
+
 def collect(developer_map: list[dict], since: datetime | None = None) -> list[dict]:
     """Reconstruct session_meta-shaped records from JSONL across all claude dirs.
 
-    Excludes sub-agent transcripts (non-recursive *.jsonl glob). Groups by internal
-    sessionId so resumed/forked sessions (multiple files) collapse to one record.
+    Excludes sub-agent transcripts from the main ingestion (non-recursive *.jsonl
+    glob) so lines/tokens are not double-counted. A targeted second pass over
+    sub-agent files still sets uses_web_fetch / uses_web_search correctly, since
+    those tools are only invoked inside delegated sub-agents, never in the parent.
     """
     # session_id -> _Acc (across files, so resumes merge)
     accs: dict[str, _Acc] = {}
@@ -221,6 +269,10 @@ def collect(developer_map: list[dict], since: datetime | None = None) -> list[di
                     if since and _too_old(jsonl_file, since):
                         continue
                     _ingest_file(jsonl_file, key, claude_dir, accs)
+
+                # Second pass: scan sub-agent files only for web-tool flags.
+                # WebFetch/WebSearch are invoked by sub-agents, not the parent session.
+                _scan_subagents_for_web_tools(project_dir, accs, since)
 
     return [a.to_record() for a in accs.values() if a.first_dt is not None]
 
@@ -244,6 +296,59 @@ def _ingest_file(path: Path, dev_key: str, claude_dir: Path, accs: dict[str, _Ac
         if acc is None:
             acc = accs[sid] = _Acc(sid, dev_key, claude_dir)
         acc.add_message(msg)
+
+
+def _mark_web_tools(path: Path, acc: "_Acc") -> None:
+    """Set uses_web_fetch / uses_web_search on acc from one sub-agent file."""
+    if acc.uses_web_fetch and acc.uses_web_search:
+        return  # already both set — skip
+    try:
+        for line in path.read_text(errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            if msg.get("type") != "assistant":
+                continue
+            for block in msg.get("message", {}).get("content", []) or []:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                name = block.get("name", "")
+                if name == "WebSearch":
+                    acc.uses_web_search = True
+                elif name == "WebFetch":
+                    acc.uses_web_fetch = True
+            if acc.uses_web_fetch and acc.uses_web_search:
+                return
+    except Exception:
+        pass
+
+
+def _scan_subagents_for_web_tools(
+    project_dir: Path, accs: dict, since: datetime | None
+) -> None:
+    """Mark web-tool flags on parent session accumulators from sub-agent files."""
+    # Agent tool sub-agents: <session>/subagents/<agent>.jsonl
+    for sub_file in project_dir.glob("*/subagents/*.jsonl"):
+        if since and _too_old(sub_file, since):
+            continue
+        parent_sid = sub_file.parent.parent.name
+        acc = accs.get(parent_sid)
+        if acc:
+            _mark_web_tools(sub_file, acc)
+
+    # Workflow tool sub-agents: <session>/subagents/workflows/<run-id>/<agent>.jsonl
+    for wf_file in project_dir.glob("*/subagents/workflows/*/*.jsonl"):
+        if wf_file.stem in _WF_SKIP_STEMS:
+            continue
+        if since and _too_old(wf_file, since):
+            continue
+        parent_sid = wf_file.parents[3].name
+        acc = accs.get(parent_sid)
+        if acc:
+            _mark_web_tools(wf_file, acc)
 
 
 # Fields JSONL can't reliably derive — overlay from telemetry where it exists.

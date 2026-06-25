@@ -66,12 +66,14 @@ def _collect(developer_map: list[dict], since: datetime, store: MetricsStore, da
 
     raw_turn_events: list[dict] = []
     raw_busy_segments: list[dict] = []
+    raw_segment_signals: list[dict] = []
     raw_agent_tasks: dict = {}
     if not daily_only:
         logger.info("[batch] Parsing session transcripts (JSONL)...")
         processed = store.processed_sessions()
         raw_turn_events = sessions.collect(developer_map, processed_sessions=processed, since=since)
         raw_busy_segments = sessions.collect_segments(developer_map, since=since)
+        raw_segment_signals = sessions.collect_segment_signals(developer_map, since=since)
         raw_agent_tasks = agent_tasks.collect(developer_map, processed_sessions=processed, since=since)
         logger.info(f"[batch]   {len(raw_turn_events)} turn events, "
                     f"{len(raw_busy_segments)} busy segments, "
@@ -89,10 +91,11 @@ def _collect(developer_map: list[dict], since: datetime, store: MetricsStore, da
                     f"(telemetry had {tele})")
 
     return {
-        "session_metas": raw_session_metas,
-        "turn_events":   raw_turn_events,
-        "busy_segments": raw_busy_segments,
-        "facets":        raw_facets,
+        "session_metas":   raw_session_metas,
+        "turn_events":     raw_turn_events,
+        "busy_segments":   raw_busy_segments,
+        "segment_signals": raw_segment_signals,
+        "facets":          raw_facets,
         "app_state":     raw_app_state,
         "plans":         raw_plans,
         "agent_tasks":   raw_agent_tasks,
@@ -134,6 +137,7 @@ def _compute(raw: dict, team_size: int | None, week: str, store: MetricsStore,
         turns_by_session = dict(turns_by_session),
         skill_events     = skill_events,
         busy_segments    = raw.get("busy_segments") or [],
+        segment_signals  = raw.get("segment_signals") or [],
         turn_events      = te,
         facets           = raw["facets"],
         plans            = raw["plans"],
@@ -187,10 +191,11 @@ def _pull_raw(since: datetime, store: MetricsStore, daily_only: bool, central_db
         logger.info(f"[batch] Period: since {since.date().isoformat()}")
         cs = CentralStore(central_db)
         raw = cs.pull_raw(since=since)
+        dev_name_map = cs.developer_names()
         cs.close()
         logger.info(f"[batch]   {len(raw['session_metas'])} sessions, "
                     f"{len(raw['turn_events'])} turn events from store")
-        return raw, {}
+        return raw, dev_name_map
     else:
         logger.info(f"[batch] Starting {'daily' if daily_only else 'weekly'} run")
         logger.info(f"[batch] Period: since {since.date().isoformat()}")
@@ -330,11 +335,17 @@ def print_report(payload: dict) -> None:
     logger.info(f"  Team Velocity       {team.get('velocity',{}).get('team_velocity',0):>6.0f}  lines / agent hour")
     logger.info(f"  Skill Invocations   {team.get('skills',{}).get('total_invocations',0):>6}")
     logger.info("")
-    logger.info(f"  {'Developer':<20} {'Score':>6} {'AgentHrs':>9} {'Status':<15}")
-    logger.info("  " + "-" * 54)
+    logger.info(f"  {'Developer':<18} {'Team (org/project)':<34} {'Score':>6} {'AgentHrs':>9} {'Status':<13}")
+    logger.info("  " + "-" * 86)
     for d in devs:
         flag = " ← needs attention" if d.get("agent_hours_status") == "stuck" else ""
-        logger.info(f"  {str(d.get('name','?')):<20} {d['ai_native_score']:>6.1f} {d.get('agent_hours_week',0):>8.1f}h  {d.get('agent_hours_status',''):<15}{flag}")
+        name = (str(d.get("name") or "unknown"))[:17]
+        team = (str(d.get("team") or "unknown"))[:33]
+        logger.info(
+            f"  {name:<18} {team:<34} "
+            f"{d['ai_native_score']:>6.1f} {d.get('agent_hours_week',0):>8.1f}h  "
+            f"{d.get('agent_hours_status',''):<13}{flag}"
+        )
     logger.info("=" * 62)
     logger.info("")
 

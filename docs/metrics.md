@@ -6,6 +6,15 @@ Quantify how deeply a team integrates AI into their daily engineering workflow.
 "AI native" is not about having access to AI — it is about AI being the default
 way work gets done, not an occasional aid.
 
+> **Implemented.** The collectors, the class-based computer registry, both store backends
+> (SQLite + PostgreSQL), `push.py`, and `batch_runner.py` are built and running.
+>
+> **Session data source of truth = JSONL.** Per-session metrics are reconstructed from
+> `projects/**/*.jsonl` (`collectors/session_index.py`), because `usage-data/session-meta` is
+> optional telemetry with large coverage gaps. Telemetry is used only to fill orphan sessions and
+> a few fields JSONL can't derive (`user_interruptions`). Each session record carries a `source`
+> field (`jsonl` | `telemetry`). See `docs/jsonl-session-index-plan.md`.
+
 ---
 
 ## Audience & Metric Map
@@ -182,29 +191,38 @@ Team_Avg_Depth = mean(Session_Depth_Score) across all sessions in period
 
 ---
 
-### M6 — Harness Utilization Score
+### M6 — Harness Utilization → Orchestration Usage Score  *(IMPLEMENTED — accurate rewrite)*
 **Audience:** CTO, Team Lead
 **Description:** Are developers using Claude Code's orchestration capabilities beyond basic chat?
 
+> **Rewritten for accuracy** (`computers/harness.py`, see `docs/orchestration-usage-accuracy-plan.md`).
+> The old proxies below were replaced by raw JSONL signals. Output key is `orchestration_score`
+> with a `harness_score` alias. The Workflow component (0 real usage) and the lifetime
+> `hasUsedBackgroundTask` flag were dropped. Per ISO week.
+
 ```
-Components (each 0–25 points):
+Three components (each 0–33.3 points), scored from raw JSONL:
 
-  Plan_Mode_Score =
-    min(25, plan_files_created_this_week × 5)
-    (from plans/ directory file count delta)
+  Plan_Mode =
+    (sessions with permission_mode == 'plan' / total sessions) × 33.34
+    (fallback in --daily mode only: min(33.34, new_plans_since_last_run × 6.5))
 
-  Task_Agent_Score =
-    (sessions_with_uses_task_agent / total_sessions) × 25
+  Sub_Agent =
+    (delegating sessions / total) × 33.34
+    delegating = agent_tasks.tasks  OR  uses_task_agent  OR  sidechain busy-segment
 
-  Background_Task_Score =
-    25 if hasUsedBackgroundTask=true in any .claude*.json else 0
+  Background =
+    min(33.34, background_task_events_this_week × 11)
+    (agent-less queue-operation enqueues — collectors/agent_tasks.background_tasks)
 
-  Workflow_Score =
-    (sessions_with_Workflow_in_tool_counts / total_sessions) × 25
-
-Harness_Score (0–100) =
-  Plan_Mode_Score + Task_Agent_Score + Background_Task_Score + Workflow_Score
+Orchestration_Score (0–100) = Plan_Mode + Sub_Agent + Background
 ```
+
+Deprecated proxies (pre-rewrite, kept for history): plan-file count, `uses_task_agent` only,
+lifetime `hasUsedBackgroundTask` flag, `Workflow` in tool_counts.
+
+> Composite still consumes this under the `harness` component key (weight unchanged here; the
+> readiness/orchestration reweighting is owned by `docs/metrics-redesign-plan.md`).
 
 ---
 
@@ -443,7 +461,7 @@ else         → Stable
 ┌─────────────────────────────────────────────────────────────┐
 │  Parallel Agent Sessions  34%  of sessions use multi-agent  │
 │  Avg Parallel Agents      2.3  per agentive session         │
-│  Harness Score            58 / 100  (Plan+Task+Workflow)    │
+│  Orchestration Usage      58 / 100  (Plan+SubAgent+Backgrnd)│
 │  Skill Invocations        127 / week  (9 unique skills)     │
 │  Session Depth            Avg 48 / 100                      │
 │  Multi-Account Coverage   1.4×  (40% sessions in alt acct) │
@@ -462,7 +480,7 @@ else         → Stable
 
 ---
 
-## Implementation Plan
+## Implementation (built)
 
 ### Architecture
 
@@ -470,30 +488,38 @@ else         → Stable
 scrape_data/
   collectors/
     discover.py          ← find all .claude* dirs, build developer identity map
-    sessions.py          ← parse session JSONL files (incremental)
-    session_meta.py      ← parse usage-data/session-meta/*.json
-    facets.py            ← parse usage-data/facets/*.json
+    sessions.py          ← parse JSONL: turn events + busy segments (agent hours)
+    session_index.py     ← JSONL → session_meta-shaped records (SOURCE OF TRUTH)
+    session_meta.py      ← usage-data/session-meta telemetry (enrichment / orphans)
+    agent_tasks.py       ← queue-operation tasks + background_tasks (M6 orchestration)
+    facets.py            ← parse usage-data/facets/*.json (M9)
     app_state.py         ← parse .claude*.json root files (numStartups, flags)
-    plans.py             ← count plan files per account
+    plans.py             ← count plan files per account (M6 fallback)
     plugins.py           ← parse installed_plugins.json
     settings.py          ← parse settings.json (hooks, permission modes)
-  computers/
-    agent_hours.py       ← M3
-    parallel_agents.py   ← M4
-    adoption.py          ← M2
-    depth.py             ← M5
-    harness.py           ← M6
-    skills.py            ← M7
-    trust.py             ← M8
-    outcomes.py          ← M9
-    velocity.py          ← M10
-    composite.py         ← M1 (depends on all others)
-  batch_runner.py        ← orchestrator
+  computers/             ← MetricComputer subclasses on a singleton registry
+    base.py              ← ComputeContext + MetricComputer ABC
+    registry.py          ← topo-orders deps; metric/score phases
+    agent_hours.py M3 · adoption.py M2 · parallel_agents.py M4 · depth.py M5
+    harness.py M6(orchestration) · skills.py M7 · trust.py M8 · outcomes.py M9
+    velocity.py M10 · consistency.py M13 · composite.py M1 · equity.py M14/M15
+  batch_runner.py        ← orchestrator (local or --from-store)
+  push.py                ← per-machine collect → central store (no compute)
+  central_store.py       ← SQLite + PostgreSQL backends (push / pull_raw / stats)
   metrics_store.py       ← incremental state + output writer
+  validate.py            ← sanity checks
   docs/
-    metrics.md           ← this file
+    metrics.md                          ← this file
+    metrics-redesign-plan.md            ← parent plan (harness split + registry)
+    orchestration-usage-accuracy-plan.md← child plan (M6 accuracy) — done
+    jsonl-session-index-plan.md         ← JSONL-primary sessions — done
   CLAUDE.md
 ```
+
+> Computers register via `@registry.register` and declare `name` / `deps` / `phase`. The registry
+> topologically sorts them (`velocity` after `agent_hours`, `equity` after `composite`) and runs two
+> phases: `metric` (once) and `score` (per ISO week). Adding a metric = a new registered class + one
+> import line in `computers/__init__.py` — no `batch_runner` changes.
 
 ---
 

@@ -47,6 +47,13 @@ def _label(score: float) -> str:
     return "AI Absent"
 
 
+def _dominant_team(sessions: list[dict]) -> str:
+    """Developer's team = their most-active project's 'org/repo' (by session count)."""
+    from collections import Counter
+    teams = Counter(s.get("team") for s in sessions if s.get("team"))
+    return teams.most_common(1)[0][0] if teams else "unknown"
+
+
 def _score_developer(
     developer_key: str,
     adoption_data: dict,
@@ -143,7 +150,8 @@ class Composite(MetricComputer):
                 consistency_data = ctx.get("consistency").get(key, {}),
                 week             = week,
             )
-            score["name"] = ctx.dev_name_map.get(key, key[:12])
+            score["name"] = ctx.dev_name_map.get(key) or "unknown"
+            score["team"] = _dominant_team(ctx.sessions_by_dev.get(key, []))
             wk = ctx.get("agent_hours").get(key, {}).get("by_week", {}).get(week, {})
             score["agent_hours_week"]   = wk.get("agent_hours", 0.0)
             score["agent_hours_status"] = wk.get("status", "unknown")

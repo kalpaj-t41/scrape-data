@@ -71,18 +71,58 @@ def CentralStore(db_path=None):
 
 _CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS session_metas (
-    session_id    TEXT PRIMARY KEY,
-    developer_key TEXT NOT NULL,
-    week          TEXT,
-    date          TEXT,
-    pushed_at     TEXT NOT NULL,
-    data          TEXT NOT NULL
+    session_id              TEXT PRIMARY KEY,
+    developer_key           TEXT NOT NULL,
+    week                    TEXT,
+    date                    TEXT,
+    pushed_at               TEXT NOT NULL,
+    claude_dir              TEXT,
+    account_type            TEXT,
+    project_path            TEXT,
+    git_org                 TEXT,
+    git_project             TEXT,
+    team                    TEXT,
+    source                  TEXT,
+    start_time              TEXT,
+    start_dt                TEXT,
+    duration_minutes        REAL,
+    user_message_count      INTEGER DEFAULT 0,
+    assistant_message_count INTEGER DEFAULT 0,
+    input_tokens            INTEGER DEFAULT 0,
+    output_tokens           INTEGER DEFAULT 0,
+    lines_added             INTEGER DEFAULT 0,
+    lines_removed           INTEGER DEFAULT 0,
+    files_modified          INTEGER DEFAULT 0,
+    git_commits             INTEGER DEFAULT 0,
+    git_pushes              INTEGER DEFAULT 0,
+    tool_errors             INTEGER DEFAULT 0,
+    user_interruptions      INTEGER DEFAULT 0,
+    uses_task_agent         INTEGER DEFAULT 0,
+    uses_mcp                INTEGER DEFAULT 0,
+    uses_web_search         INTEGER DEFAULT 0,
+    uses_web_fetch          INTEGER DEFAULT 0,
+    first_prompt            TEXT,
+    ai_title                TEXT,
+    tool_counts             TEXT DEFAULT '{}',
+    languages               TEXT DEFAULT '{}',
+    user_response_times     TEXT DEFAULT '[]',
+    agent_names             TEXT DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS turn_events (
-    session_id    TEXT PRIMARY KEY,
-    developer_key TEXT NOT NULL,
-    pushed_at     TEXT NOT NULL,
-    data          TEXT NOT NULL
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id              TEXT NOT NULL,
+    developer_key           TEXT,
+    pushed_at               TEXT NOT NULL,
+    event_type              TEXT DEFAULT 'turn',
+    user_ts                 TEXT,
+    assistant_ts            TEXT,
+    agent_ms                REAL,
+    is_sidechain            INTEGER DEFAULT 0,
+    permission_mode         TEXT,
+    tool_uses               TEXT DEFAULT '[]',
+    agent_colors_in_session INTEGER DEFAULT 0,
+    command                 TEXT,
+    prompt_text             TEXT
 );
 CREATE TABLE IF NOT EXISTS facets (
     session_id    TEXT PRIMARY KEY,
@@ -91,10 +131,24 @@ CREATE TABLE IF NOT EXISTS facets (
     data          TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS agent_tasks (
-    session_id    TEXT PRIMARY KEY,
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       TEXT NOT NULL,
+    developer_key    TEXT,
+    pushed_at        TEXT NOT NULL,
+    task_id          TEXT,
+    agent_name       TEXT,
+    task_description TEXT,
+    status           TEXT,
+    enqueued_at      TEXT,
+    week             TEXT
+);
+CREATE TABLE IF NOT EXISTS background_tasks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL,
     developer_key TEXT,
     pushed_at     TEXT NOT NULL,
-    data          TEXT NOT NULL
+    enqueued_at   TEXT,
+    week          TEXT
 );
 CREATE TABLE IF NOT EXISTS app_state (
     developer_key TEXT PRIMARY KEY,
@@ -114,10 +168,16 @@ CREATE TABLE IF NOT EXISTS developers (
     claude_dirs   TEXT,
     pushed_at     TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_sm_dev  ON session_metas(developer_key);
-CREATE INDEX IF NOT EXISTS idx_sm_week ON session_metas(week);
-CREATE INDEX IF NOT EXISTS idx_sm_date ON session_metas(date);
-CREATE INDEX IF NOT EXISTS idx_te_dev  ON turn_events(developer_key);
+CREATE INDEX IF NOT EXISTS idx_sm_dev   ON session_metas(developer_key);
+CREATE INDEX IF NOT EXISTS idx_sm_week  ON session_metas(week);
+CREATE INDEX IF NOT EXISTS idx_sm_date  ON session_metas(date);
+CREATE INDEX IF NOT EXISTS idx_te_sid   ON turn_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_te_dev   ON turn_events(developer_key);
+CREATE INDEX IF NOT EXISTS idx_at_sid   ON agent_tasks(session_id);
+CREATE INDEX IF NOT EXISTS idx_at_dev   ON agent_tasks(developer_key);
+CREATE INDEX IF NOT EXISTS idx_at_week  ON agent_tasks(week);
+CREATE INDEX IF NOT EXISTS idx_at_name  ON agent_tasks(agent_name);
+CREATE INDEX IF NOT EXISTS idx_bt_sid   ON background_tasks(session_id);
 CREATE TABLE IF NOT EXISTS busy_segments (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id    TEXT NOT NULL,
@@ -311,44 +371,87 @@ class _BaseStore:
     """Shared push / pull / stats logic for SQLite — backends supply _execute / _commit / _fetchall."""
 
     def push(self, raw: dict, force: bool = False) -> dict:
-        # force is honored only for busy_segments (session-level replace, always on);
-        # other SQLite tables use INSERT OR IGNORE / REPLACE semantics.
         now = datetime.now(tz=timezone.utc).isoformat()
-        inserted = {"session_metas": 0, "turn_events": 0, "facets": 0, "app_state": 0, "plans": 0, "agent_tasks": 0, "busy_segments": 0}
+        inserted = {
+            "session_metas": 0, "turn_events": 0, "facets": 0,
+            "app_state": 0, "plans": 0, "agent_tasks": 0,
+            "background_tasks": 0, "busy_segments": 0,
+        }
 
         for meta in raw.get("session_metas", []):
             sid = meta.get("session_id")
             if not sid:
                 continue
+            sm_row = {
+                "session_id":              sid,
+                "developer_key":           meta.get("developer_key", ""),
+                "week":                    meta.get("week"),
+                "date":                    meta.get("date"),
+                "pushed_at":               now,
+                "claude_dir":              meta.get("claude_dir"),
+                "account_type":            meta.get("account_type"),
+                "project_path":            meta.get("project_path"),
+                "git_org":                 meta.get("git_org"),
+                "git_project":             meta.get("git_project"),
+                "team":                    meta.get("team"),
+                "source":                  meta.get("source"),
+                "start_time":              meta.get("start_time"),
+                "start_dt":                meta.get("start_dt"),
+                "duration_minutes":        meta.get("duration_minutes"),
+                "user_message_count":      meta.get("user_message_count", 0) or 0,
+                "assistant_message_count": meta.get("assistant_message_count", 0) or 0,
+                "input_tokens":            meta.get("input_tokens", 0) or 0,
+                "output_tokens":           meta.get("output_tokens", 0) or 0,
+                "lines_added":             meta.get("lines_added", 0) or 0,
+                "lines_removed":           meta.get("lines_removed", 0) or 0,
+                "files_modified":          meta.get("files_modified", 0) or 0,
+                "git_commits":             meta.get("git_commits", 0) or 0,
+                "git_pushes":              meta.get("git_pushes", 0) or 0,
+                "tool_errors":             meta.get("tool_errors", 0) or 0,
+                "user_interruptions":      meta.get("user_interruptions", 0) or 0,
+                "uses_task_agent":         int(bool(meta.get("uses_task_agent", False))),
+                "uses_mcp":                int(bool(meta.get("uses_mcp", False))),
+                "uses_web_search":         int(bool(meta.get("uses_web_search", False))),
+                "uses_web_fetch":          int(bool(meta.get("uses_web_fetch", False))),
+                "first_prompt":            meta.get("first_prompt"),
+                "ai_title":                meta.get("ai_title"),
+                "tool_counts":             _dumps(meta.get("tool_counts") or {}),
+                "languages":               _dumps(meta.get("languages") or {}),
+                "user_response_times":     _dumps(meta.get("user_response_times") or []),
+                "agent_names":             _dumps(meta.get("agent_names") or []),
+            }
             if force:
-                # Refresh existing rows (e.g. cutover to JSONL-primary records).
-                n = self._upsert_replace(
-                    "session_metas",
-                    {"session_id": sid, "developer_key": meta.get("developer_key", ""),
-                     "week": meta.get("week"), "date": meta.get("date"),
-                     "pushed_at": now, "data": _dumps(meta)},
-                    conflict_col="session_id",
-                )
+                n = self._upsert_replace("session_metas", sm_row, conflict_col="session_id")
             else:
+                cols = ", ".join(sm_row.keys())
+                ph   = ", ".join(["{p}"] * len(sm_row))
                 n = self._upsert_ignore(
-                    "INSERT INTO session_metas (session_id, developer_key, week, date, pushed_at, data) "
-                    "VALUES ({p},{p},{p},{p},{p},{p})",
-                    (sid, meta.get("developer_key", ""), meta.get("week"), meta.get("date"), now, _dumps(meta)),
+                    f"INSERT INTO session_metas ({cols}) VALUES ({ph})",
+                    tuple(sm_row.values()),
                 )
             inserted["session_metas"] += n
 
-        turns_by_session: dict[str, list] = {}
+        # turn_events — one row per turn; always replace all turns for sessions in this push
+        turn_sids = {t.get("session_id") for t in raw.get("turn_events", []) if t.get("session_id")}
+        for sid in turn_sids:
+            self._execute("DELETE FROM turn_events WHERE session_id = {p}", (sid,))
         for t in raw.get("turn_events", []):
-            turns_by_session.setdefault(t.get("session_id", ""), []).append(t)
-
-        for sid, turns in turns_by_session.items():
-            dev_key = turns[0].get("developer_key", "") if turns else ""
-            n = self._upsert_ignore(
-                "INSERT INTO turn_events (session_id, developer_key, pushed_at, data) "
-                "VALUES ({p},{p},{p},{p})",
-                (sid, dev_key, now, _dumps(turns)),
+            sid = t.get("session_id", "")
+            if not sid:
+                continue
+            self._execute(
+                "INSERT INTO turn_events "
+                "(session_id, developer_key, pushed_at, event_type, user_ts, assistant_ts, "
+                "agent_ms, is_sidechain, permission_mode, tool_uses, agent_colors_in_session, "
+                "command, prompt_text) "
+                "VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p},{p})",
+                (sid, t.get("developer_key", ""), now,
+                 t.get("event_type", "turn"), t.get("user_ts"), t.get("assistant_ts"),
+                 t.get("agent_ms"), 1 if t.get("is_sidechain") else 0,
+                 t.get("permission_mode"), _dumps(t.get("tool_uses") or []),
+                 t.get("agent_colors_in_session", 0), t.get("command"), t.get("prompt_text")),
             )
-            inserted["turn_events"] += n
+            inserted["turn_events"] += 1
 
         for sid, f in raw.get("facets", {}).items():
             n = self._upsert_ignore(
@@ -374,20 +477,42 @@ class _BaseStore:
             )
             inserted["plans"] += n
 
-        # agent_tasks — full session record as JSON (preserves tasks + background_tasks).
-        # REPLACE so re-pushes refresh the record (e.g. new background_tasks field).
+        # agent_tasks — one row per named task; always replace all rows for sessions in this push
         for sid, at in raw.get("agent_tasks", {}).items():
             if not sid:
                 continue
-            n = self._upsert_replace(
-                "agent_tasks",
-                {"session_id": sid, "developer_key": at.get("developer_key", ""),
-                 "pushed_at": now, "data": _dumps(at)},
-                conflict_col="session_id",
-            )
-            inserted["agent_tasks"] += n
+            dev_key = at.get("developer_key", "")
+            self._execute("DELETE FROM agent_tasks WHERE session_id = {p}", (sid,))
+            self._execute("DELETE FROM background_tasks WHERE session_id = {p}", (sid,))
+            for task in at.get("tasks", []):
+                self._execute(
+                    "INSERT INTO agent_tasks "
+                    "(session_id, developer_key, pushed_at, task_id, agent_name, "
+                    "task_description, status, enqueued_at, week) "
+                    "VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p})",
+                    (sid, dev_key, now, task.get("task_id"), task.get("agent_name"),
+                     task.get("task_description"), task.get("status"),
+                     task.get("enqueued_at"), task.get("week")),
+                )
+                inserted["agent_tasks"] += 1
+            for bt in at.get("background_tasks", []):
+                self._execute(
+                    "INSERT INTO background_tasks "
+                    "(session_id, developer_key, pushed_at, enqueued_at, week) "
+                    "VALUES ({p},{p},{p},{p},{p})",
+                    (sid, dev_key, now, bt.get("enqueued_at"), bt.get("week")),
+                )
+                inserted["background_tasks"] += 1
+            # Back-populate ai_title and agent_names into session_metas
+            ai_title    = at.get("ai_title")
+            agent_names = at.get("agent_names", [])
+            if ai_title or agent_names:
+                self._execute(
+                    "UPDATE session_metas SET ai_title={p}, agent_names={p} WHERE session_id={p}",
+                    (ai_title, _dumps(agent_names), sid),
+                )
 
-        # busy_segments — session-level replace (reparse of JSONL is authoritative)
+        # busy_segments — session-level replace (JSONL reparse is authoritative)
         seg_sids = {s.get("session_id") for s in raw.get("busy_segments", []) if s.get("session_id")}
         for sid in seg_sids:
             self._execute("DELETE FROM busy_segments WHERE session_id = {p}", (sid,))
@@ -434,24 +559,51 @@ class _BaseStore:
         rows = self._fetchall("SELECT session_id FROM session_metas")
         return {r[0] for r in rows}
 
+    def developer_names(self) -> dict[str, str]:
+        """{developer_key: name} for report display (name, not the hash id)."""
+        return {r[0]: r[1] for r in self._fetchall(
+            "SELECT developer_key, name FROM developers") if r[1]}
+
     def pushed_turn_session_ids(self) -> set[str]:
         return set()  # SQLite — collect all sessions each run
 
     def pushed_agent_session_ids(self) -> set[str]:
-        rows = self._fetchall("SELECT session_id FROM agent_tasks")
+        rows = self._fetchall("SELECT DISTINCT session_id FROM agent_tasks")
         return {r[0] for r in rows}
 
     def pull_raw(self, since: datetime | None = None) -> dict:
         since_date = since.date().isoformat() if since else None
 
+        _SM_FIELDS = (
+            "session_id", "developer_key", "week", "date", "claude_dir", "account_type",
+            "project_path", "git_org", "git_project", "team", "source", "start_time",
+            "start_dt", "duration_minutes", "user_message_count", "assistant_message_count",
+            "input_tokens", "output_tokens", "lines_added", "lines_removed", "files_modified",
+            "git_commits", "git_pushes", "tool_errors", "user_interruptions",
+            "uses_task_agent", "uses_mcp", "uses_web_search", "uses_web_fetch",
+            "first_prompt", "ai_title", "tool_counts", "languages", "user_response_times",
+            "agent_names",
+        )
+        sel = ", ".join(_SM_FIELDS)
         if since_date:
             rows = self._fetchall(
-                "SELECT data FROM session_metas WHERE date >= {p} OR date IS NULL",
+                f"SELECT {sel} FROM session_metas WHERE date >= {{p}} OR date IS NULL",
                 (since_date,),
             )
         else:
-            rows = self._fetchall("SELECT data FROM session_metas")
-        session_metas = [json.loads(r[0]) for r in rows]
+            rows = self._fetchall(f"SELECT {sel} FROM session_metas")
+
+        session_metas = []
+        for r in rows:
+            d = dict(zip(_SM_FIELDS, r))
+            for jf in ("tool_counts", "languages", "user_response_times", "agent_names"):
+                raw_val = d.get(jf)
+                d[jf] = json.loads(raw_val) if raw_val else ({} if jf in ("tool_counts", "languages") else [])
+            d["uses_task_agent"] = bool(d.get("uses_task_agent"))
+            d["uses_mcp"]        = bool(d.get("uses_mcp"))
+            d["uses_web_search"] = bool(d.get("uses_web_search"))
+            d["uses_web_fetch"]  = bool(d.get("uses_web_fetch"))
+            session_metas.append(d)
 
         in_scope = {m["session_id"] for m in session_metas}
         turn_events: list[dict] = []
@@ -461,8 +613,20 @@ class _BaseStore:
             ph = ",".join(["{p}"] * len(in_scope))
             args = tuple(in_scope)
 
-            for r in self._fetchall(f"SELECT data FROM turn_events WHERE session_id IN ({ph})", args):
-                turn_events.extend(json.loads(r[0]))
+            _TE_FIELDS = (
+                "session_id", "developer_key", "event_type", "user_ts", "assistant_ts",
+                "agent_ms", "is_sidechain", "permission_mode", "tool_uses",
+                "agent_colors_in_session", "command", "prompt_text",
+            )
+            te_sel = ", ".join(_TE_FIELDS)
+            for r in self._fetchall(
+                f"SELECT {te_sel} FROM turn_events WHERE session_id IN ({ph})", args
+            ):
+                d = dict(zip(_TE_FIELDS, r))
+                d["is_sidechain"] = bool(d.get("is_sidechain"))
+                raw_tu = d.get("tool_uses")
+                d["tool_uses"] = json.loads(raw_tu) if raw_tu else []
+                turn_events.append(d)
 
             for r in self._fetchall(f"SELECT session_id, data FROM facets WHERE session_id IN ({ph})", args):
                 facets[r[0]] = json.loads(r[1])
@@ -473,15 +637,55 @@ class _BaseStore:
         rows = self._fetchall("SELECT developer_key, data FROM plans")
         plans = {r[0]: json.loads(r[1]) for r in rows}
 
-        # agent_tasks — full records (not gated by session_metas): background_tasks
-        # may live in JSONL-only sessions; parallel_agents/harness read them directly.
+        # Reconstruct agent_tasks: {session_id: {session_id, developer_key, ai_title, agent_names, tasks, background_tasks}}
+        # agent_tasks/background_tasks not gated by in_scope — JSONL-only sessions still count.
         agent_tasks: dict[str, dict] = {}
-        for r in self._fetchall("SELECT session_id, data FROM agent_tasks"):
-            agent_tasks[r[0]] = json.loads(r[1])
 
-        # All segments (not gated by session_metas): they carry their own
-        # developer_key + start_ts, so agent_hours doesn't need the session
-        # registry. JSONL-only sessions (no session-meta) still count.
+        # Seed ai_title and agent_names from session_metas columns
+        for sm in session_metas:
+            sid = sm["session_id"]
+            if sm.get("ai_title") or sm.get("agent_names"):
+                agent_tasks[sid] = {
+                    "session_id":       sid,
+                    "developer_key":    sm.get("developer_key", ""),
+                    "ai_title":         sm.get("ai_title"),
+                    "agent_names":      list(sm.get("agent_names") or []),
+                    "tasks":            [],
+                    "background_tasks": [],
+                }
+
+        for r in self._fetchall(
+            "SELECT session_id, developer_key, task_id, agent_name, task_description, "
+            "status, enqueued_at, week FROM agent_tasks"
+        ):
+            sid = r[0]
+            if sid not in agent_tasks:
+                agent_tasks[sid] = {
+                    "session_id": sid, "developer_key": r[1],
+                    "ai_title": None, "agent_names": [], "tasks": [], "background_tasks": [],
+                }
+            task = {
+                "task_id":          r[2],
+                "agent_name":       r[3],
+                "task_description": r[4],
+                "status":           r[5],
+                "enqueued_at":      r[6],
+                "week":             r[7],
+            }
+            agent_tasks[sid]["tasks"].append(task)
+            if r[3] and r[3] not in agent_tasks[sid]["agent_names"]:
+                agent_tasks[sid]["agent_names"].append(r[3])
+
+        for r in self._fetchall("SELECT session_id, enqueued_at, week FROM background_tasks"):
+            sid = r[0]
+            if sid not in agent_tasks:
+                agent_tasks[sid] = {
+                    "session_id": sid, "developer_key": "",
+                    "ai_title": None, "agent_names": [], "tasks": [], "background_tasks": [],
+                }
+            agent_tasks[sid]["background_tasks"].append({"enqueued_at": r[1], "week": r[2]})
+
+        # All segments (not gated by in_scope): JSONL-only sessions still count.
         busy_segments: list[dict] = []
         for r in self._fetchall(
             "SELECT session_id, developer_key, start_ts, end_ts, is_sidechain FROM busy_segments"
@@ -506,14 +710,15 @@ class _BaseStore:
 
     def stats(self) -> dict:
         return {
-            "session_metas": self._fetchall("SELECT COUNT(*) FROM session_metas")[0][0],
-            "turn_events":   self._fetchall("SELECT COUNT(*) FROM turn_events")[0][0],
-            "facets":        self._fetchall("SELECT COUNT(*) FROM facets")[0][0],
-            "app_state":     self._fetchall("SELECT COUNT(*) FROM app_state")[0][0],
-            "plans":         self._fetchall("SELECT COUNT(*) FROM plans")[0][0],
-            "agent_tasks":   self._fetchall("SELECT COUNT(*) FROM agent_tasks")[0][0],
-            "busy_segments": self._fetchall("SELECT COUNT(*) FROM busy_segments")[0][0],
-            "developers":    self._fetchall(
+            "session_metas":    self._fetchall("SELECT COUNT(*) FROM session_metas")[0][0],
+            "turn_events":      self._fetchall("SELECT COUNT(*) FROM turn_events")[0][0],
+            "facets":           self._fetchall("SELECT COUNT(*) FROM facets")[0][0],
+            "app_state":        self._fetchall("SELECT COUNT(*) FROM app_state")[0][0],
+            "plans":            self._fetchall("SELECT COUNT(*) FROM plans")[0][0],
+            "agent_tasks":      self._fetchall("SELECT COUNT(*) FROM agent_tasks")[0][0],
+            "background_tasks": self._fetchall("SELECT COUNT(*) FROM background_tasks")[0][0],
+            "busy_segments":    self._fetchall("SELECT COUNT(*) FROM busy_segments")[0][0],
+            "developers":       self._fetchall(
                 "SELECT COUNT(DISTINCT developer_key) FROM session_metas"
             )[0][0],
         }
@@ -528,11 +733,24 @@ class _SQLiteStore(_BaseStore):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path))
         self._conn.execute("PRAGMA journal_mode=WAL")
-        for stmt in _CREATE_TABLES.strip().split(";"):
-            stmt = stmt.strip()
-            if stmt:
-                self._conn.execute(stmt)
         self._conn.commit()
+
+        # Detect old blob schema: session_metas has a 'data' column
+        _old = False
+        try:
+            self._conn.execute("SELECT data FROM session_metas LIMIT 0")
+            _old = True
+        except Exception:
+            pass
+
+        if _old:
+            self._migrate_from_blob_schema()
+        else:
+            for stmt in _CREATE_TABLES.strip().split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    self._conn.execute(stmt)
+            self._conn.commit()
 
     def _fmt(self, sql: str) -> str:
         return sql.replace("{p}", "?")
@@ -559,6 +777,164 @@ class _SQLiteStore(_BaseStore):
             f"INSERT OR REPLACE INTO {table} ({cols}) VALUES ({ph})", vals
         )
         return cur.rowcount
+
+    def _migrate_from_blob_schema(self) -> None:
+        """One-time migration from JSON-blob schema to normalized columns."""
+        import logging as _log
+        _log.getLogger(__name__).info(
+            "central.db: migrating from blob schema to normalized columns…"
+        )
+
+        # 1. Read all data from old tables into memory
+        old_sm: list[dict] = []
+        try:
+            for r in self._conn.execute(
+                "SELECT data, pushed_at FROM session_metas"
+            ).fetchall():
+                d = json.loads(r[0])
+                d.setdefault("pushed_at", r[1])
+                old_sm.append(d)
+        except Exception:
+            pass
+
+        old_te: dict = {}
+        try:
+            for r in self._conn.execute(
+                "SELECT session_id, developer_key, pushed_at, data FROM turn_events"
+            ).fetchall():
+                old_te[r[0]] = {
+                    "developer_key": r[1], "pushed_at": r[2],
+                    "turns": json.loads(r[3]),
+                }
+        except Exception:
+            pass
+
+        old_at: dict = {}
+        try:
+            for r in self._conn.execute(
+                "SELECT session_id, developer_key, pushed_at, data FROM agent_tasks"
+            ).fetchall():
+                d = json.loads(r[3])
+                d["_pushed_at"] = r[2]
+                d["developer_key"] = r[1]
+                old_at[r[0]] = d
+        except Exception:
+            pass
+
+        # 2. Drop old tables so CREATE TABLE IF NOT EXISTS picks up new DDL
+        for tbl in ("session_metas", "turn_events", "agent_tasks"):
+            self._conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+        self._conn.commit()
+
+        # 3. Create new normalized tables
+        for stmt in _CREATE_TABLES.strip().split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                self._conn.execute(stmt)
+        self._conn.commit()
+
+        now = datetime.now(tz=timezone.utc).isoformat()
+
+        # 4. Re-insert session_metas
+        for d in old_sm:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO session_metas "
+                "(session_id, developer_key, week, date, pushed_at, claude_dir, account_type, "
+                "project_path, git_org, git_project, team, source, start_time, start_dt, "
+                "duration_minutes, user_message_count, assistant_message_count, "
+                "input_tokens, output_tokens, lines_added, lines_removed, files_modified, "
+                "git_commits, git_pushes, tool_errors, user_interruptions, "
+                "uses_task_agent, uses_mcp, uses_web_search, uses_web_fetch, "
+                "first_prompt, ai_title, tool_counts, languages, user_response_times, agent_names) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    d.get("session_id"), d.get("developer_key", ""),
+                    d.get("week"), d.get("date"), d.get("pushed_at", now),
+                    d.get("claude_dir"), d.get("account_type"), d.get("project_path"),
+                    d.get("git_org"), d.get("git_project"), d.get("team"), d.get("source"),
+                    d.get("start_time"), d.get("start_dt"), d.get("duration_minutes"),
+                    d.get("user_message_count", 0) or 0,
+                    d.get("assistant_message_count", 0) or 0,
+                    d.get("input_tokens", 0) or 0, d.get("output_tokens", 0) or 0,
+                    d.get("lines_added", 0) or 0, d.get("lines_removed", 0) or 0,
+                    d.get("files_modified", 0) or 0, d.get("git_commits", 0) or 0,
+                    d.get("git_pushes", 0) or 0, d.get("tool_errors", 0) or 0,
+                    d.get("user_interruptions", 0) or 0,
+                    int(bool(d.get("uses_task_agent", False))),
+                    int(bool(d.get("uses_mcp", False))),
+                    int(bool(d.get("uses_web_search", False))),
+                    int(bool(d.get("uses_web_fetch", False))),
+                    d.get("first_prompt"), d.get("ai_title"),
+                    _dumps(d.get("tool_counts") or {}),
+                    _dumps(d.get("languages") or {}),
+                    _dumps(d.get("user_response_times") or []),
+                    _dumps(d.get("agent_names") or []),
+                ),
+            )
+
+        # 5. Re-insert turn_events (one row per turn)
+        for sid, te_data in old_te.items():
+            pushed_at = te_data.get("pushed_at", now)
+            dev_key   = te_data.get("developer_key", "")
+            for t in te_data.get("turns", []):
+                self._conn.execute(
+                    "INSERT INTO turn_events "
+                    "(session_id, developer_key, pushed_at, event_type, user_ts, assistant_ts, "
+                    "agent_ms, is_sidechain, permission_mode, tool_uses, agent_colors_in_session, "
+                    "command, prompt_text) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        t.get("session_id", sid),
+                        t.get("developer_key", dev_key),
+                        pushed_at,
+                        t.get("event_type", "turn"),
+                        t.get("user_ts"), t.get("assistant_ts"), t.get("agent_ms"),
+                        1 if t.get("is_sidechain") else 0,
+                        t.get("permission_mode"),
+                        _dumps(t.get("tool_uses") or []),
+                        t.get("agent_colors_in_session", 0),
+                        t.get("command"), t.get("prompt_text"),
+                    ),
+                )
+
+        # 6. Re-insert agent_tasks and background_tasks
+        for sid, at_data in old_at.items():
+            pushed_at = at_data.get("_pushed_at", now)
+            dev_key   = at_data.get("developer_key", "")
+            for task in at_data.get("tasks", []):
+                self._conn.execute(
+                    "INSERT INTO agent_tasks "
+                    "(session_id, developer_key, pushed_at, task_id, agent_name, "
+                    "task_description, status, enqueued_at, week) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        sid, dev_key, pushed_at,
+                        task.get("task_id"), task.get("agent_name"),
+                        task.get("task_description"), task.get("status"),
+                        task.get("enqueued_at"), task.get("week"),
+                    ),
+                )
+            for bt in at_data.get("background_tasks", []):
+                self._conn.execute(
+                    "INSERT INTO background_tasks "
+                    "(session_id, developer_key, pushed_at, enqueued_at, week) "
+                    "VALUES (?,?,?,?,?)",
+                    (sid, dev_key, pushed_at, bt.get("enqueued_at"), bt.get("week")),
+                )
+            ai_title    = at_data.get("ai_title")
+            agent_names = at_data.get("agent_names", [])
+            if ai_title or agent_names:
+                self._conn.execute(
+                    "UPDATE session_metas SET ai_title=?, agent_names=? WHERE session_id=?",
+                    (ai_title, _dumps(agent_names), sid),
+                )
+
+        self._conn.commit()
+        _log.getLogger(__name__).info(
+            f"Migration complete: {len(old_sm)} sessions, "
+            f"{sum(len(v.get('turns', [])) for v in old_te.values())} turns, "
+            f"{sum(len(v.get('tasks', [])) for v in old_at.values())} tasks"
+        )
 
     def close(self):
         self._conn.close()
@@ -997,6 +1373,11 @@ class _PostgresStore:
     def pushed_session_ids(self) -> set[str]:
         rows = self._fetchall("SELECT session_id FROM scrape_data.session_metas")
         return {r[0] for r in rows}
+
+    def developer_names(self) -> dict[str, str]:
+        """{developer_key: name} for report display (name, not the hash id)."""
+        return {r[0]: r[1] for r in self._fetchall(
+            "SELECT developer_key, name FROM scrape_data.developers") if r[1]}
 
     def pushed_turn_session_ids(self) -> set[str]:
         """Session IDs already in turn_events — used for incremental turn collection."""

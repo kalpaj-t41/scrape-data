@@ -19,6 +19,9 @@ from computers import (  # noqa: F401
     outcomes,
     velocity,
     consistency,
+    efficiency,
+    usefulness,
+    agent_quality,
     composite,
     equity,
 )

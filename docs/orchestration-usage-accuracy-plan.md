@@ -1,8 +1,18 @@
 # Plan — Accurate Orchestration Usage (fixes M7 in the metrics redesign)
 
-> Supplies the missing "fix the measurement" piece for the *M7 Orchestration Usage* step in
-> `docs/metrics-redesign-plan.md` (which currently keeps the runtime logic unchanged / rename-only).
-> Status: **approved, deferred** — execute later.
+> **CHILD of `docs/metrics-redesign-plan.md`** — supplies the "fix the measurement" content for its
+> *M7 Orchestration Usage* step (the parent had left it rename-only).
+>
+> Status: ✅ **IMPLEMENTED & VERIFIED.**
+> - `computers/harness.py` rewritten: 3 accurate components (plan mode via `permission_mode='plan'`,
+>   sub-agent delegation, background tasks via `queue-operation` enqueues); Workflow + lifetime flag
+>   dropped; emits `orchestration_score` (+`harness_score` alias) with per-week breakdown.
+> - `collectors/agent_tasks.py`: captures agent-less enqueues as `background_tasks`.
+> - `computers/composite.py`: reads per-week orchestration with fallback.
+> - Store persistence added so the background component survives `--from-store` on **both** backends:
+>   SQLite `agent_tasks` table; PostgreSQL `background_tasks` table (push/pull/stats).
+> - Verified locally and against the remote PG (background_tasks pushed + pulled; harness scores vary
+>   by week). Composite weights unchanged (owned by the parent plan).
 
 ## Context
 

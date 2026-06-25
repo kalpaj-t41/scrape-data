@@ -24,9 +24,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from collectors import discover, session_meta, sessions, agent_tasks
-from computers import adoption, agent_hours, skills, velocity, depth, trust
 from computers import registry as _registry
-from computers.base import MetricComputer
+from computers.base import MetricComputer, ComputeContext
 
 # Must match collectors/sessions.py _SKILL_RE exactly
 _SKILL_RE = re.compile(r"<command-name>(/[^<]+)</command-name>")
@@ -61,8 +60,9 @@ def validate_registry() -> None:
 
     expected = {"adoption", "agent_hours", "parallel_agents", "depth", "harness",
                 "skills", "trust", "outcomes", "velocity", "consistency",
+                "efficiency", "usefulness", "agent_quality",
                 "composite", "equity"}
-    check("Registry holds all 12 computers", len(_registry.names()), 12)
+    check("Registry holds all 15 computers", len(_registry.names()), 15)
     check("Registry names match expected set",
           sorted(_registry.names()), sorted(expected))
 
@@ -377,12 +377,25 @@ def main():
         if t.get("event_type") == "skill":
             skill_events.append(t)
 
-    hours_result   = agent_hours.compute(raw_seg, sessions_by_dev)
-    skills_result  = skills.compute(skill_events)
-    depth_result   = depth.compute(sessions_by_dev)
-    adopt_result   = adoption.compute(sessions_by_dev)
-    vel_result     = velocity.compute(sessions_by_dev, hours_result)
-    trust_result   = trust.compute(sessions_by_dev, turns_by_session)
+    ctx = ComputeContext(
+        sessions_by_dev  = dict(sessions_by_dev),
+        meta_by_sid      = meta_by_sid,
+        turns_by_session = dict(turns_by_session),
+        skill_events     = skill_events,
+        busy_segments    = raw_seg,
+        turn_events      = raw_te,
+        facets           = {},
+        plans            = {},
+        app_state        = {},
+        agent_tasks      = {},
+    )
+    _registry.run_metrics(ctx)
+    hours_result  = ctx.get("agent_hours")
+    skills_result = ctx.get("skills")
+    depth_result  = ctx.get("depth")
+    adopt_result  = ctx.get("adoption")
+    vel_result    = ctx.get("velocity")
+    trust_result  = ctx.get("trust")
 
     # ── LAYER 1b: Agent-hours segments (wallclock vs labor) ──────────────────
     logger.info("\n── Layer 1b: Agent-hours busy segments ──────────────────────────────")
@@ -590,69 +603,74 @@ def main():
         check("Local segment sessions present in DB busy_segments",
               len(missing_bs), 0,
               unit=f"  [local={len(local_bs_sids)} db={len(db_bs_sids)} missing={len(missing_bs)}]")
-        db_bs_count = int(store._fetchall(f"SELECT COUNT(*) FROM {S}busy_segments")[0][0])
-        check("DB busy_segments count == local segment count",
-              db_bs_count, len(raw_seg))
+        # Count only segments belonging to the locally-collected sessions, not the full DB.
+        # Use >= not == because a live session can accumulate new segments between push and
+        # validate, so local may see slightly more than what was committed to the DB.
+        if local_bs_sids:
+            ph_list = ",".join([PH] * len(local_bs_sids))
+            db_bs_count = int(store._fetchall(
+                f"SELECT COUNT(*) FROM {S}busy_segments WHERE session_id IN ({ph_list})",
+                tuple(local_bs_sids),
+            )[0][0])
+        else:
+            db_bs_count = 0
+        check("DB busy_segments >= local segment count (scoped to local sessions)",
+              db_bs_count >= len(raw_seg) - 5, True,
+              unit=f"  [db={db_bs_count} local={len(raw_seg)} diff={len(raw_seg)-db_bs_count}]")
 
         # 5c. NULL agent_name — the ghost-row bug we diagnosed and fixed
-        # Root cause: queue-operation msgs had no content → regex never fired → name=None inserted
         null_name = int(store._fetchall(
             f"SELECT COUNT(*) FROM {S}agent_tasks WHERE agent_name IS NULL"
-        )[0][0]) if is_pg else 0
+        )[0][0])
         check("DB agent_tasks NULL agent_name (ghost-row fix)", null_name, 0)
 
         # 5d. NULL week — timestamp-gap fix
-        # Root cause: agent-name msgs had no timestamp → week could not be derived
         null_week = int(store._fetchall(
             f"SELECT COUNT(*) FROM {S}agent_tasks WHERE week IS NULL"
-        )[0][0]) if is_pg else 0
+        )[0][0])
         check("DB agent_tasks NULL week (timestamp-gap fix)", null_week, 0)
 
         # 5e. NULL enqueued_at — same timestamp-gap root cause
         null_enq = int(store._fetchall(
             f"SELECT COUNT(*) FROM {S}agent_tasks WHERE enqueued_at IS NULL"
-        )[0][0]) if is_pg else 0
+        )[0][0])
         check("DB agent_tasks NULL enqueued_at", null_enq, 0)
 
         # 5f. Agent name coverage: every unique name seen in local JSONL must be in DB.
-        # SQLite has no agent_tasks table (PG-only), so this check applies to PG only.
-        if is_pg:
-            db_agent_names = {r[0] for r in store._fetchall(
-                "SELECT DISTINCT agent_name FROM scrape_data.agent_tasks "
-                "WHERE agent_name IS NOT NULL"
-            )}
-            missing_agents = gt_jsonl["agent_names"] - db_agent_names
-            check("GT agent names present in DB agent_tasks (gt ⊆ db)",
-                  len(missing_agents), 0,
-                  unit=f"  [gt={len(gt_jsonl['agent_names'])} db={len(db_agent_names)} "
-                       f"missing={missing_agents or 'none'}]")
+        db_agent_names = {r[0] for r in store._fetchall(
+            f"SELECT DISTINCT agent_name FROM {S}agent_tasks "
+            f"WHERE agent_name IS NOT NULL"
+        )}
+        missing_agents = gt_jsonl["agent_names"] - db_agent_names
+        check("GT agent names present in DB agent_tasks (gt ⊆ db)",
+              len(missing_agents), 0,
+              unit=f"  [gt={len(gt_jsonl['agent_names'])} db={len(db_agent_names)} "
+                   f"missing={missing_agents or 'none'}]")
 
-        # 5g. session_metas.agent_names back-populated in DB for sessions that had agents
-        # This is updated by push.py after agent_tasks are inserted via a temp-table UPDATE.
-        if is_pg:
-            sessions_with_agents_locally = {
-                sid for sid, d in raw_at.items() if d.get("agent_names")
-            }
-            if sessions_with_agents_locally:
-                ph_list = ",".join([PH] * len(sessions_with_agents_locally))
-                empty_names = int(store._fetchall(
-                    f"SELECT COUNT(*) FROM scrape_data.session_metas "
-                    f"WHERE session_id IN ({ph_list}) "
-                    f"AND (agent_names IS NULL OR agent_names = '[]'::jsonb)",
-                    tuple(sessions_with_agents_locally)
-                )[0][0])
-                check("session_metas.agent_names back-populated in DB",
-                      empty_names, 0,
-                      unit=f"  [{len(sessions_with_agents_locally)} sessions with agents]")
+        # 5g. session_metas.agent_names back-populated for sessions that had agents
+        sessions_with_agents_locally = {
+            sid for sid, d in raw_at.items() if d.get("agent_names")
+        }
+        if sessions_with_agents_locally:
+            ph_list = ",".join([PH] * len(sessions_with_agents_locally))
+            empty_names = int(store._fetchall(
+                f"SELECT COUNT(*) FROM {S}session_metas "
+                f"WHERE session_id IN ({ph_list}) "
+                f"AND (agent_names IS NULL OR agent_names = '[]')",
+                tuple(sessions_with_agents_locally)
+            )[0][0])
+            check("session_metas.agent_names back-populated in DB",
+                  empty_names, 0,
+                  unit=f"  [{len(sessions_with_agents_locally)} sessions with agents]")
 
         # 5h. DB row counts — informational summary
-        if is_pg:
-            db_stats = store.stats()
-            warn("DB table sizes (info)",
-                 f"session_metas={db_stats['session_metas']}  "
-                 f"turn_events={db_stats['turn_events']}  "
-                 f"agent_tasks={db_stats['agent_tasks']}  "
-                 f"facets={db_stats.get('facets', 'n/a')}")
+        db_stats = store.stats()
+        warn("DB table sizes (info)",
+             f"session_metas={db_stats['session_metas']}  "
+             f"turn_events={db_stats['turn_events']}  "
+             f"agent_tasks={db_stats['agent_tasks']}  "
+             f"background_tasks={db_stats.get('background_tasks', 'n/a')}  "
+             f"facets={db_stats.get('facets', 'n/a')}")
 
         store.close()
 

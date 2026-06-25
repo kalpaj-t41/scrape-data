@@ -21,6 +21,7 @@ from pathlib import Path
 
 
 _SUMMARY_RE     = re.compile(r'Agent "([^"]+)"')
+_WF_SUMMARY_RE  = re.compile(r'Dynamic workflow "([^"]+)"')
 _TASK_ID_RE     = re.compile(r'<task-id>([^<]+)</task-id>')
 _STATUS_RE      = re.compile(r'<status>([^<]+)</status>')
 _SUMMARY_TAG_RE = re.compile(r'<summary>(.*?)</summary>', re.DOTALL)
@@ -57,6 +58,7 @@ def _parse_queue_content(content: str) -> dict:
     if m:
         summary_text = m.group(1).strip()
         am = _SUMMARY_RE.search(summary_text)
+        wm = _WF_SUMMARY_RE.search(summary_text)
         if am:
             # Format: Agent "name: description" completed
             label = am.group(1)
@@ -64,8 +66,12 @@ def _parse_queue_content(content: str) -> dict:
                 agent_name, task_description = label.split(": ", 1)
             else:
                 agent_name = label
+        elif wm:
+            # Format: Dynamic workflow "description" completed
+            agent_name = wm.group(1)
+            task_description = summary_text
         else:
-            # Summary present but doesn't follow Agent "..." format —
+            # Summary present but doesn't follow either format —
             # keep it as task_description; agent_name resolved from agent-name msg later.
             task_description = summary_text
 
@@ -137,6 +143,9 @@ def _process_jsonl(path: Path, developer_key: str) -> dict:
             # Only insert if we have an agent name — a task_id alone is not useful
             if parsed.get("agent_name"):
                 tasks.append(parsed)
+                name = parsed["agent_name"]
+                if name not in agent_names_seen:
+                    agent_names_seen.append(name)
             else:
                 background_tasks.append({
                     "enqueued_at": ts_raw or None,
