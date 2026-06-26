@@ -21,10 +21,25 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from collectors import discover, session_meta, session_index, sessions, facets, app_state, plans, plugins, settings, agent_tasks
+from collectors import discover, session_meta, session_index, sessions, facets, app_state, plans, plugins, settings, agent_tasks, codex_sessions
 from central_store import CentralStore
 
 logger = logging.getLogger(__name__)
+
+
+def _load_dotenv() -> None:
+    """Load KEY=VALUE pairs from a sibling .env into os.environ (no override of
+    already-set vars). Minimal, stdlib-only — avoids a python-dotenv dependency."""
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
 
 
 def _parse_since(s: str) -> datetime:
@@ -46,8 +61,10 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
         if k != "backend":
             logger.info(f"         {k:<20} {v:>6} rows")
 
-    # Discover local .claude* dirs and register developers
+    # Discover local .claude* dirs and register developers.
+    # Fold in any local .codex* dirs so Codex + Claude work merge under one key.
     developer_map = discover.build_developer_map()
+    codex_sessions.augment_developer_map(developer_map)
     dev_dirs = [d for dev in developer_map for d in dev["claude_dirs"]]
     logger.info(f"\n[push] Found {len(developer_map)} developer(s) across {len(dev_dirs)} account(s):")
     for dev in developer_map:
@@ -92,6 +109,17 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     raw_busy_segments = sessions.collect_segments(developer_map, since=since)
     seg_sessions = len({s["session_id"] for s in raw_busy_segments})
     logger.info(f"         {len(raw_busy_segments)} segments across {seg_sessions} sessions")
+
+    # ── Codex (OpenAI) rollouts — same record shapes, source="codex" ──────────
+    if codex_sessions.find_codex_dirs():
+        logger.info("[push] Collecting Codex (OpenAI) sessions...")
+        cx = codex_sessions.collect(developer_map, processed_sessions=already_te, since=since)
+        cx_new_metas = [m for m in cx["session_metas"] if m["session_id"] not in already_sm]
+        new_metas         = new_metas + cx_new_metas
+        raw_turn_events   = raw_turn_events + cx["turn_events"]
+        raw_busy_segments = raw_busy_segments + cx["busy_segments"]
+        logger.info(f"         codex: {len(cx_new_metas)} new sessions, "
+                    f"{len(cx['turn_events'])} turns, {len(cx['busy_segments'])} segments")
 
     logger.info("[push] Collecting facets, app state, plans, agent tasks...")
     raw_facets      = facets.collect(developer_map)
@@ -168,6 +196,7 @@ def main():
                         help="Show what would be pushed without writing anything")
     args = parser.parse_args()
 
+    _load_dotenv()
     target = args.central or os.environ.get("POSTGRES_URL")
     if not target:
         logger.error("Error: provide --central <path/url> or set POSTGRES_URL env var")
