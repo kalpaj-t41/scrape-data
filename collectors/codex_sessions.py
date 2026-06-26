@@ -48,7 +48,7 @@ from . import discover
 
 logger = logging.getLogger(__name__)
 
-SOURCE = "codex"
+SOURCE = "codex"  # provenance literal (which collector produced the row), like Claude's "jsonl"
 _MAX_GAP_S = 600.0  # 10 min — same human-idle cutoff sessions.py uses to split busy segments.
 
 # exec_command shell strings that signal a git action (best-effort, counts invocations).
@@ -58,6 +58,21 @@ _EXIT_CODE_RE = re.compile(r"exited with code\s+(\d+)")
 
 
 # ── small helpers ─────────────────────────────────────────────────────────────
+
+def _account_type(codex_dir: Path) -> str:
+    """Which account on a multi-account machine — derived from the dir name, the
+    same axis as session_meta._account_type. Provider lives in `source`, not here.
+      .codex → primary; *work* → work; *personal* → personal; else other.
+    """
+    name = codex_dir.name.lower()
+    if "work" in name:
+        return "work"
+    if "personal" in name:
+        return "personal"
+    if name == ".codex":
+        return "primary"
+    return "other"
+
 
 def _parse_iso(ts: str | None) -> datetime | None:
     if not ts:
@@ -377,8 +392,8 @@ def parse_session(path: Path, developer_key: str, codex_dir: str) -> dict | None
         "session_id": session_id,
         "developer_key": developer_key,
         "claude_dir": codex_dir,                 # reuse the column; it's the .codex dir here
-        "account_type": SOURCE,
-        "source": SOURCE,
+        "account_type": _account_type(Path(codex_dir)),  # work/personal/primary — NOT the provider
+        "source": SOURCE,                        # provider discriminator: "codex"
         "project_path": project_path,
         "start_time": start_dt.isoformat() if start_dt else None,
         "week": _week_of(start_dt),

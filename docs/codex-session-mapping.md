@@ -21,8 +21,11 @@ default — we never fabricate (see the no-synthetic-data project rule).
 | `developer_key` | `sha256(git email)` | **same** — `sha256(git email)` resolved from global git config; a dev's Codex + Claude work merge under one key |
 | `source` column | `null` / `telemetry` / jsonl | `"codex"` (set on every row) |
 
-`account_type` is set to `"codex"`; the existing `claude_dir` column holds the
-`.codex` directory path (column reused, not renamed).
+`source="codex"` is the sole **provider** discriminator. `account_type` is the
+orthogonal **account** axis (`work`/`personal`/`primary`/`other`), derived from
+the `.codex*` dir name exactly like the Claude side — NOT overloaded with the
+provider. The existing `claude_dir` column holds the `.codex` directory path
+(column reused, not renamed).
 
 ## 2. Record-type → pipeline stage
 
@@ -47,8 +50,8 @@ default — we never fabricate (see the no-synthetic-data project rule).
 | `session_id` | `session_meta.payload.id` | |
 | `developer_key` | `sha256(git email)` | merges with Claude identity |
 | `claude_dir` | `.codex` dir path | column reused |
-| `account_type` | `"codex"` | |
-| `source` | `"codex"` | already an existing column |
+| `account_type` | derived from `.codex*` dir name | `work`/`personal`/`primary`/`other` — account axis, not provider |
+| `source` | `"codex"` | existing column; the provider discriminator |
 | `project_path` | `session_meta.payload.cwd` | |
 | `start_time` | `session_meta.payload.timestamp` | falls back to first record ts |
 | `week` / `date` | derived from `start_time` | ISO week |
