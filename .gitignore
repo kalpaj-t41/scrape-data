@@ -37,3 +37,9 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Local notes and scratch docs
+localDocs/
+AGENTS.md
+ecosystem-schema-normalization-plan.md
+639783a4-e467-4420-97b4-de8033cc819f.jsonl

@@ -89,6 +89,7 @@ class _Acc:
         self.claude_dir = claude_dir
         self.first_dt: datetime | None = None
         self.last_dt: datetime | None = None
+        self.last_prompt_dt: datetime | None = None
         self.first_prompt = ""
         self.cwd: str | None = None
         self.user_msgs = 0
@@ -155,6 +156,8 @@ class _Acc:
                 )
             if is_human:
                 self.user_msgs += 1
+                if ts and (self.last_prompt_dt is None or ts > self.last_prompt_dt):
+                    self.last_prompt_dt = ts
                 if not self.first_prompt:
                     self.first_prompt = _extract_user_text(msg)[:500]
                 # idle "response time" = gap from last assistant reply to this human prompt
@@ -229,6 +232,7 @@ class _Acc:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "source": "jsonl",
+            "last_prompt_ts": self.last_prompt_dt.isoformat() if self.last_prompt_dt else None,
         }
 
 
@@ -241,6 +245,71 @@ def _too_old(path: Path, since: datetime) -> bool:
 
 
 _WF_SKIP_STEMS = {"journal", "history"}
+
+
+def _latest_prompt_from_jsonl(path: Path) -> tuple[str, datetime | None]:
+    latest: datetime | None = None
+    session_id = path.stem
+
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except Exception:
+        return session_id, None
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+
+        session_id = msg.get("sessionId") or session_id
+        if msg.get("type") != "user":
+            continue
+
+        content = msg.get("message", {}).get("content", "")
+        is_human = isinstance(content, str) and content.strip()
+        if not is_human and isinstance(content, list):
+            is_human = any(
+                isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()
+                for b in content
+            )
+        if not is_human:
+            continue
+
+        ts = _parse_iso(msg.get("timestamp", "")) if msg.get("timestamp") else None
+        if ts and (latest is None or ts > latest):
+            latest = ts
+
+    return session_id, latest
+
+
+def collect_latest_prompts(
+    developer_map: list[dict],
+    since: datetime | None = None,
+) -> dict[str, str | None]:
+    results: dict[str, str | None] = {}
+
+    for dev in developer_map:
+        for claude_dir_str in dev["claude_dirs"]:
+            projects_dir = Path(claude_dir_str) / "projects"
+            if not projects_dir.exists():
+                continue
+            for project_dir in projects_dir.iterdir():
+                if not project_dir.is_dir():
+                    continue
+                for jsonl_file in project_dir.glob("*.jsonl"):
+                    if since and _too_old(jsonl_file, since):
+                        continue
+                    session_id, latest = _latest_prompt_from_jsonl(jsonl_file)
+                    latest_iso = latest.isoformat() if latest else None
+                    previous = results.get(session_id)
+                    if previous is None or (latest_iso is not None and previous < latest_iso):
+                        results[session_id] = latest_iso
+
+    return results
 
 
 def collect(developer_map: list[dict], since: datetime | None = None) -> list[dict]:

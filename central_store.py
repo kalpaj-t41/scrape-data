@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS session_metas (
     uses_web_search         INTEGER DEFAULT 0,
     uses_web_fetch          INTEGER DEFAULT 0,
     first_prompt            TEXT,
+    last_prompt_ts          TEXT,
     ai_title                TEXT,
     tool_counts             TEXT DEFAULT '{}',
     languages               TEXT DEFAULT '{}',
@@ -227,6 +228,7 @@ CREATE TABLE IF NOT EXISTS scrape_data.session_metas (
     tool_counts             JSONB DEFAULT '{}',
     languages               JSONB DEFAULT '{}',
     user_response_times     JSONB DEFAULT '[]',
+    last_prompt_ts          TIMESTAMPTZ,
     pushed_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -282,9 +284,10 @@ CREATE TABLE IF NOT EXISTS scrape_data.plans (
     pushed_at                TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-ALTER TABLE scrape_data.session_metas ADD COLUMN IF NOT EXISTS ai_title    TEXT;
-ALTER TABLE scrape_data.session_metas ADD COLUMN IF NOT EXISTS agent_names JSONB DEFAULT '[]';
-ALTER TABLE scrape_data.session_metas ADD COLUMN IF NOT EXISTS source      TEXT;
+ALTER TABLE scrape_data.session_metas ADD COLUMN IF NOT EXISTS ai_title       TEXT;
+ALTER TABLE scrape_data.session_metas ADD COLUMN IF NOT EXISTS agent_names    JSONB DEFAULT '[]';
+ALTER TABLE scrape_data.session_metas ADD COLUMN IF NOT EXISTS source         TEXT;
+ALTER TABLE scrape_data.session_metas ADD COLUMN IF NOT EXISTS last_prompt_ts TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS scrape_data.agent_tasks (
     id               BIGSERIAL PRIMARY KEY,
@@ -351,7 +354,7 @@ _SM_COLS = [
     "git_commits", "git_pushes", "first_prompt", "user_interruptions", "tool_errors",
     "uses_task_agent", "uses_mcp", "uses_web_search", "uses_web_fetch",
     "input_tokens", "output_tokens", "tool_counts", "languages", "user_response_times",
-    "ai_title", "agent_names",
+    "last_prompt_ts", "ai_title", "agent_names",
 ]
 
 _TE_COLS = [
@@ -414,27 +417,21 @@ class _BaseStore:
                 "uses_web_search":         int(bool(meta.get("uses_web_search", False))),
                 "uses_web_fetch":          int(bool(meta.get("uses_web_fetch", False))),
                 "first_prompt":            meta.get("first_prompt"),
+                "last_prompt_ts":          meta.get("last_prompt_ts"),
                 "ai_title":                meta.get("ai_title"),
                 "tool_counts":             _dumps(meta.get("tool_counts") or {}),
                 "languages":               _dumps(meta.get("languages") or {}),
                 "user_response_times":     _dumps(meta.get("user_response_times") or []),
                 "agent_names":             _dumps(meta.get("agent_names") or []),
             }
-            if force:
-                n = self._upsert_replace("session_metas", sm_row, conflict_col="session_id")
-            else:
-                cols = ", ".join(sm_row.keys())
-                ph   = ", ".join(["{p}"] * len(sm_row))
-                n = self._upsert_ignore(
-                    f"INSERT INTO session_metas ({cols}) VALUES ({ph})",
-                    tuple(sm_row.values()),
-                )
+            n = self._upsert_replace("session_metas", sm_row, conflict_col="session_id")
             inserted["session_metas"] += n
 
-        # turn_events — one row per turn; always replace all turns for sessions in this push
+        # turn_events — append only in normal mode; full replace in force mode.
         turn_sids = {t.get("session_id") for t in raw.get("turn_events", []) if t.get("session_id")}
-        for sid in turn_sids:
-            self._execute("DELETE FROM turn_events WHERE session_id = {p}", (sid,))
+        if force:
+            for sid in turn_sids:
+                self._execute("DELETE FROM turn_events WHERE session_id = {p}", (sid,))
         for t in raw.get("turn_events", []):
             sid = t.get("session_id", "")
             if not sid:
@@ -454,10 +451,15 @@ class _BaseStore:
             inserted["turn_events"] += 1
 
         for sid, f in raw.get("facets", {}).items():
-            n = self._upsert_ignore(
-                "INSERT INTO facets (session_id, developer_key, pushed_at, data) "
-                "VALUES ({p},{p},{p},{p})",
-                (sid, f.get("developer_key", ""), now, _dumps(f)),
+            n = self._upsert_replace(
+                "facets",
+                {
+                    "session_id": sid,
+                    "developer_key": f.get("developer_key", ""),
+                    "pushed_at": now,
+                    "data": _dumps(f),
+                },
+                conflict_col="session_id",
             )
             inserted["facets"] += n
 
@@ -581,7 +583,7 @@ class _BaseStore:
             "input_tokens", "output_tokens", "lines_added", "lines_removed", "files_modified",
             "git_commits", "git_pushes", "tool_errors", "user_interruptions",
             "uses_task_agent", "uses_mcp", "uses_web_search", "uses_web_fetch",
-            "first_prompt", "ai_title", "tool_counts", "languages", "user_response_times",
+            "first_prompt", "last_prompt_ts", "ai_title", "tool_counts", "languages", "user_response_times",
             "agent_names",
         )
         sel = ", ".join(_SM_FIELDS)
@@ -752,6 +754,18 @@ class _SQLiteStore(_BaseStore):
                     self._conn.execute(stmt)
             self._conn.commit()
 
+        self._ensure_columns()
+
+    def _ensure_columns(self):
+        for stmt in (
+            "ALTER TABLE session_metas ADD COLUMN last_prompt_ts TEXT",
+        ):
+            try:
+                self._conn.execute(stmt)
+            except Exception:
+                pass
+        self._conn.commit()
+
     def _fmt(self, sql: str) -> str:
         return sql.replace("{p}", "?")
 
@@ -845,8 +859,8 @@ class _SQLiteStore(_BaseStore):
                 "input_tokens, output_tokens, lines_added, lines_removed, files_modified, "
                 "git_commits, git_pushes, tool_errors, user_interruptions, "
                 "uses_task_agent, uses_mcp, uses_web_search, uses_web_fetch, "
-                "first_prompt, ai_title, tool_counts, languages, user_response_times, agent_names) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "first_prompt, last_prompt_ts, ai_title, tool_counts, languages, user_response_times, agent_names) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     d.get("session_id"), d.get("developer_key", ""),
                     d.get("week"), d.get("date"), d.get("pushed_at", now),
@@ -864,7 +878,7 @@ class _SQLiteStore(_BaseStore):
                     int(bool(d.get("uses_mcp", False))),
                     int(bool(d.get("uses_web_search", False))),
                     int(bool(d.get("uses_web_fetch", False))),
-                    d.get("first_prompt"), d.get("ai_title"),
+                    d.get("first_prompt"), d.get("last_prompt_ts"), d.get("ai_title"),
                     _dumps(d.get("tool_counts") or {}),
                     _dumps(d.get("languages") or {}),
                     _dumps(d.get("user_response_times") or []),
@@ -941,6 +955,10 @@ class _SQLiteStore(_BaseStore):
 
     def stats(self) -> dict:
         return {**super().stats(), "backend": "sqlite", "db_path": str(self.db_path)}
+
+    def session_prompt_cursors(self) -> dict[str, str | None]:
+        rows = self._fetchall("SELECT session_id, last_prompt_ts FROM session_metas")
+        return {r[0]: r[1] for r in rows}
 
 
 # ── PostgreSQL backend (scrape_data schema) ───────────────────────────────────
@@ -1045,6 +1063,7 @@ class _PostgresStore:
                 Json(meta.get("languages") or {}),
                 Json(meta.get("user_response_times") or []),
                 meta.get("source"),
+                meta.get("last_prompt_ts"),
                 now,
             ))
         if sm_rows:
@@ -1059,8 +1078,39 @@ class _PostgresStore:
                     first_prompt, user_interruptions, tool_errors,
                     uses_task_agent, uses_mcp, uses_web_search, uses_web_fetch,
                     input_tokens, output_tokens,
-                    tool_counts, languages, user_response_times, source, pushed_at
-                ) VALUES %s ON CONFLICT (session_id) DO NOTHING
+                    tool_counts, languages, user_response_times, source, last_prompt_ts, pushed_at
+                ) VALUES %s
+                ON CONFLICT (session_id) DO UPDATE SET
+                    developer_key = EXCLUDED.developer_key,
+                    claude_dir = EXCLUDED.claude_dir,
+                    account_type = EXCLUDED.account_type,
+                    project_path = EXCLUDED.project_path,
+                    start_time = EXCLUDED.start_time,
+                    week = EXCLUDED.week,
+                    date = EXCLUDED.date,
+                    duration_minutes = EXCLUDED.duration_minutes,
+                    user_message_count = EXCLUDED.user_message_count,
+                    assistant_message_count = EXCLUDED.assistant_message_count,
+                    lines_added = EXCLUDED.lines_added,
+                    lines_removed = EXCLUDED.lines_removed,
+                    files_modified = EXCLUDED.files_modified,
+                    git_commits = EXCLUDED.git_commits,
+                    git_pushes = EXCLUDED.git_pushes,
+                    first_prompt = EXCLUDED.first_prompt,
+                    user_interruptions = EXCLUDED.user_interruptions,
+                    tool_errors = EXCLUDED.tool_errors,
+                    uses_task_agent = EXCLUDED.uses_task_agent,
+                    uses_mcp = EXCLUDED.uses_mcp,
+                    uses_web_search = EXCLUDED.uses_web_search,
+                    uses_web_fetch = EXCLUDED.uses_web_fetch,
+                    input_tokens = EXCLUDED.input_tokens,
+                    output_tokens = EXCLUDED.output_tokens,
+                    tool_counts = EXCLUDED.tool_counts,
+                    languages = EXCLUDED.languages,
+                    user_response_times = EXCLUDED.user_response_times,
+                    source = EXCLUDED.source,
+                    last_prompt_ts = EXCLUDED.last_prompt_ts,
+                    pushed_at = EXCLUDED.pushed_at
                 """,
                 sm_rows,
             )
@@ -1169,7 +1219,18 @@ class _PostgresStore:
                     session_id, developer_key, underlying_goal, goal_categories,
                     outcome, session_type, claude_helpfulness,
                     friction_counts, friction_detail, primary_success, brief_summary, pushed_at
-                ) VALUES %s ON CONFLICT (session_id) DO NOTHING
+                ) VALUES %s ON CONFLICT (session_id) DO UPDATE SET
+                    developer_key = EXCLUDED.developer_key,
+                    underlying_goal = EXCLUDED.underlying_goal,
+                    goal_categories = EXCLUDED.goal_categories,
+                    outcome = EXCLUDED.outcome,
+                    session_type = EXCLUDED.session_type,
+                    claude_helpfulness = EXCLUDED.claude_helpfulness,
+                    friction_counts = EXCLUDED.friction_counts,
+                    friction_detail = EXCLUDED.friction_detail,
+                    primary_success = EXCLUDED.primary_success,
+                    brief_summary = EXCLUDED.brief_summary,
+                    pushed_at = EXCLUDED.pushed_at
                 """,
                 facet_rows,
             )
@@ -1233,7 +1294,10 @@ class _PostgresStore:
             inserted["plans"] = len(plan_rows)
 
         # ── agent_tasks — bulk insert + bulk UPDATE session_metas ────────────
-        existing_at = self._existing_agent_sessions(cur)
+        agent_task_sids = [sid for sid in raw.get("agent_tasks", {}) if sid]
+        if agent_task_sids and not force:
+            cur.execute("DELETE FROM scrape_data.agent_tasks WHERE session_id = ANY(%s)", (agent_task_sids,))
+            cur.execute("DELETE FROM scrape_data.background_tasks WHERE session_id = ANY(%s)", (agent_task_sids,))
         at_rows = []
         title_updates = []
         for session_id, at_data in raw.get("agent_tasks", {}).items():
@@ -1242,8 +1306,6 @@ class _PostgresStore:
             dev_key     = at_data.get("developer_key", "")
             if ai_title or agent_names:
                 title_updates.append((ai_title, Json(agent_names), session_id))
-            if session_id in existing_at:
-                continue
             for task in at_data.get("tasks", []):
                 if not task.get("agent_name") and not task.get("task_id"):
                     continue   # skip ghost rows with no identity
@@ -1291,8 +1353,6 @@ class _PostgresStore:
         # ── background_tasks — agent-less queue-operation enqueues (harness M7) ──
         bt_rows = []
         for session_id, at_data in raw.get("agent_tasks", {}).items():
-            if session_id in existing_at:
-                continue
             dev_key = at_data.get("developer_key", "")
             for bt in at_data.get("background_tasks", []) or []:
                 bt_rows.append((session_id, dev_key, bt.get("enqueued_at"), bt.get("week"), now))
@@ -1373,6 +1433,13 @@ class _PostgresStore:
     def pushed_session_ids(self) -> set[str]:
         rows = self._fetchall("SELECT session_id FROM scrape_data.session_metas")
         return {r[0] for r in rows}
+
+    def session_prompt_cursors(self) -> dict[str, str | None]:
+        rows = self._fetchall("SELECT session_id, last_prompt_ts FROM scrape_data.session_metas")
+        return {
+            r[0]: (r[1].isoformat() if hasattr(r[1], "isoformat") else r[1])
+            for r in rows
+        }
 
     def developer_names(self) -> dict[str, str]:
         """{developer_key: name} for report display (name, not the hash id)."""
