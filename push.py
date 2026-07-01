@@ -13,8 +13,10 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +27,10 @@ from collectors import discover, session_meta, session_index, sessions, facets, 
 from central_store import CentralStore
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_CURSOR_STATE = Path.home() / ".claude-metrics" / "push_cursor.json"
+_CURSOR_STATE_ENV = "SCRAPE_DATA_CURSOR_STATE"
+_MIN_GAP_ENV = "SCRAPE_DATA_MIN_PROMPT_GAP"
 
 
 def _parse_since(s: str) -> datetime:
@@ -43,10 +49,82 @@ def _parse_iso(ts: str | None) -> datetime | None:
         return None
 
 
+def _parse_gap(spec: str | None) -> timedelta:
+    if not spec:
+        return timedelta(hours=1)
+    raw = spec.strip().lower()
+    if raw in {"0", "0s", "off", "none", "false"}:
+        return timedelta(0)
+    match = re.fullmatch(r"(\d+)([smhd])", raw)
+    if not match:
+        return timedelta(hours=1)
+    value = int(match.group(1))
+    unit = match.group(2)
+    if unit == "s":
+        return timedelta(seconds=value)
+    if unit == "m":
+        return timedelta(minutes=value)
+    if unit == "h":
+        return timedelta(hours=value)
+    return timedelta(days=value)
+
+
+def _cursor_state_path() -> Path:
+    raw = os.environ.get(_CURSOR_STATE_ENV)
+    if raw:
+        return Path(raw).expanduser()
+    return _DEFAULT_CURSOR_STATE
+
+
+class LocalCursorStore:
+    def __init__(self, path: Path | None = None):
+        self.path = path or _cursor_state_path()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._state = self._load()
+
+    def _load(self) -> dict:
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text())
+                if isinstance(data, dict):
+                    sessions = data.get("sessions")
+                    if isinstance(sessions, dict):
+                        return data
+            except Exception:
+                pass
+        return {"sessions": {}}
+
+    def session_cursors(self) -> dict[str, str | None]:
+        sessions = self._state.get("sessions", {})
+        return {
+            sid: (entry.get("last_prompt_ts") if isinstance(entry, dict) else None)
+            for sid, entry in sessions.items()
+        }
+
+    def update_session(self, session_id: str, last_prompt_ts: str | None) -> None:
+        if not session_id or not last_prompt_ts:
+            return
+        sessions = self._state.setdefault("sessions", {})
+        sessions[session_id] = {
+            "last_prompt_ts": last_prompt_ts,
+            "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+        }
+
+    def update_many(self, session_ids: set[str], prompt_cursors: dict[str, str | None]) -> None:
+        for session_id in session_ids:
+            self.update_session(session_id, prompt_cursors.get(session_id))
+
+    def save(self) -> None:
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(self._state, indent=2, sort_keys=True))
+        tmp.replace(self.path)
+
+
 def _select_sessions_for_push(
     current_prompt_cursors: dict[str, str | None],
     stored_prompt_cursors: dict[str, str | None],
     force: bool,
+    min_gap: timedelta,
 ) -> set[str]:
     if force:
         return set(current_prompt_cursors)
@@ -60,7 +138,12 @@ def _select_sessions_for_push(
             continue
         current_dt = _parse_iso(current_prompt_ts)
         stored_dt = _parse_iso(stored_prompt_ts)
-        if stored_dt is None or (current_dt and current_dt > stored_dt):
+        if stored_dt is None:
+            selected.add(session_id)
+            continue
+        if not current_dt or current_dt <= stored_dt:
+            continue
+        if (current_dt - stored_dt) >= min_gap:
             selected.add(session_id)
     return selected
 
@@ -99,11 +182,15 @@ def _filter_turn_events(
 
 def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     store = CentralStore(central_db)
+    cursor_store = LocalCursorStore()
+    min_gap = _parse_gap(os.environ.get(_MIN_GAP_ENV, "1h"))
 
     stats_before = store.stats()
     logger.info(f"[push] Connecting to central store")
     logger.info(f"[push] Period  : since {since.date().isoformat()}")
     logger.info(f"[push] Mode    : {'FORCE (ignoring existing)' if force else 'incremental'}")
+    logger.info(f"[push] Cursor  : {cursor_store.path}")
+    logger.info(f"[push] Gap     : {min_gap}")
     logger.info(f"[push] DB state before push:")
     for k, v in stats_before.items():
         if k != "backend":
@@ -120,12 +207,13 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
     if not dry_run:
         store.upsert_developers(developer_map)
 
-    stored_prompt_cursors = {} if force else store.session_prompt_cursors()
+    stored_prompt_cursors = {} if force else cursor_store.session_cursors()
     current_prompt_cursors = session_index.collect_latest_prompts(developer_map, since=since)
     selected_session_ids = _select_sessions_for_push(
         current_prompt_cursors,
         stored_prompt_cursors,
         force=force,
+        min_gap=min_gap,
     )
     skipped_sessions = max(len(current_prompt_cursors) - len(selected_session_ids), 0)
 
@@ -221,6 +309,8 @@ def push(central_db, since: datetime, dry_run: bool, force: bool) -> None:
         return
 
     inserted = store.push(raw, force=force)
+    cursor_store.update_many(selected_session_ids, current_prompt_cursors)
+    cursor_store.save()
     store.close()
 
     stats_delta = {
